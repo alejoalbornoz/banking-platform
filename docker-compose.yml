@@ -1,0 +1,46 @@
+name: banking-platform
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: banking-postgres
+    environment:
+      POSTGRES_USER: banking
+      POSTGRES_PASSWORD: banking
+      # account_db exists today; the rest are pre-created so adding a new
+      # service later never requires touching this compose file's DB setup.
+      POSTGRES_MULTIPLE_DATABASES: account_db,transaction_db,notification_db,auth_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U banking"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: banking-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: banking
+      RABBITMQ_DEFAULT_PASS: banking
+    ports:
+      - "5672:5672"   # AMQP
+      - "15672:15672" # management UI: http://localhost:15672
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  zipkin:
+    image: openzipkin/zipkin:latest
+    container_name: banking-zipkin
+    ports:
+      - "9411:9411" # UI: http://localhost:9411
+
+volumes:
+  postgres-data:
