@@ -17,6 +17,8 @@ import java.util.UUID;
 @Component
 public class AccountClient implements IAccountClient {
 
+    private static final String IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
+
     private final RestClient restClient;
 
     public AccountClient(RestClient accountServiceRestClient) {
@@ -24,20 +26,25 @@ public class AccountClient implements IAccountClient {
     }
 
     @Override
-    public void debit(UUID accountId, BigDecimal amount) {
-        call(accountId, amount, "debit");
+    public void debit(UUID accountId, String operationKey, BigDecimal amount) {
+        call(accountId, operationKey, amount, "debit");
     }
 
     @Override
-    public void credit(UUID accountId, BigDecimal amount) {
-        call(accountId, amount, "credit");
+    public void credit(UUID accountId, String operationKey, BigDecimal amount) {
+        call(accountId, operationKey, amount, "credit");
     }
 
-    private void call(UUID accountId, BigDecimal amount, String operation) {
+    private void call(UUID accountId, String operationKey, BigDecimal amount, String operation) {
         try {
             restClient.post()
                     .uri("/api/v1/accounts/{id}/{operation}", accountId, operation)
                     .contentType(MediaType.APPLICATION_JSON)
+                    // The retry template around this call can fire after a
+                    // timeout on a request that actually committed. This header
+                    // is what makes that retry a no-op on account-service's side
+                    // instead of a second withdrawal.
+                    .header(IDEMPOTENCY_KEY_HEADER, operationKey)
                     .body(new AmountClientRequest(amount))
                     .retrieve()
                     .toBodilessEntity();

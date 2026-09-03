@@ -38,14 +38,14 @@ import java.util.UUID;
  * transaction (via {@code transactionTemplate}), with the REST calls
  * happening in between, in this un-transactional orchestrating method.
  * <p>
- * <b>Known simplification:</b> account-service's debit/credit endpoints are
- * not themselves idempotent. If our retry template retries a debit call
- * after a network failure whose response we never saw (but which actually
- * committed on account-service's side), that account could be double-debited.
- * The correct fix mirrors what this class already does for transfers: give
- * account-service's endpoints an idempotency key too. Flagged here rather
- * than solved, to keep this iteration's scope to the transaction-service
- * layer.
+ * Idempotency runs at two levels, and both are needed. At the top,
+ * the client's {@code Idempotency-Key} stops a resubmitted transfer from
+ * running the saga twice. Underneath, each leg sends account-service its own
+ * derived key (see {@link #operationKeyFor}), so that a retry of a single
+ * debit or credit - by the retry template here, or by a new process after this
+ * one crashed - can't move money twice either. Without the second level, the
+ * first only narrows the window rather than closing it: a debit call that
+ * timed out after committing looks identical to one that never arrived.
  */
 @Service
 public class TransferService implements ITransferService {
@@ -55,6 +55,11 @@ public class TransferService implements ITransferService {
     private static final String AGGREGATE_TYPE = "Transaction";
     private static final String ROUTING_KEY_COMPLETED = "transfer.completed";
     private static final String ROUTING_KEY_FAILED = "transfer.failed";
+
+    /** Suffixes distinguishing the idempotency keys of a saga's three legs. */
+    private static final String LEG_DEBIT = "debit";
+    private static final String LEG_CREDIT = "credit";
+    private static final String LEG_COMPENSATION = "compensation";
 
     private final ITransactionRepository transactionRepository;
     private final IOutboxEventRepository outboxEventRepository;
@@ -141,25 +146,46 @@ public class TransferService implements ITransferService {
      * around the call. Typing the callback explicitly pins E to
      * {@code RuntimeException}, which is all our code ever throws here.
      */
-    private void debitWithRetry(UUID accountId, BigDecimal amount) {
+    private void debitWithRetry(UUID accountId, String operationKey, BigDecimal amount) {
         RetryCallback<Void, RuntimeException> callback = ctx -> {
-            accountClient.debit(accountId, amount);
+            accountClient.debit(accountId, operationKey, amount);
             return null;
         };
         remoteCallRetryTemplate.execute(callback);
     }
 
-    private void creditWithRetry(UUID accountId, BigDecimal amount) {
+    private void creditWithRetry(UUID accountId, String operationKey, BigDecimal amount) {
         RetryCallback<Void, RuntimeException> callback = ctx -> {
-            accountClient.credit(accountId, amount);
+            accountClient.credit(accountId, operationKey, amount);
             return null;
         };
         remoteCallRetryTemplate.execute(callback);
+    }
+
+    /**
+     * Derives this leg's idempotency key from the transaction id.
+     * <p>
+     * Deriving rather than generating is the whole point: a key must be
+     * <em>stable</em> across every attempt at the same leg, including attempts
+     * made by a different process after this one crashed. A freshly generated
+     * UUID would be unique per attempt, which is precisely the property that
+     * makes double-spending possible. The transaction id is already durable in
+     * our own database, so any retry - now or after a restart - recomputes the
+     * identical key.
+     * <p>
+     * The suffix matters for the compensation leg specifically: it credits the
+     * same account the debit came from, so it needs a key of its own. The other
+     * two legs touch different accounts and account-service scopes keys per
+     * account, but naming them explicitly keeps the ledger readable.
+     */
+    private static String operationKeyFor(Transaction transaction, String leg) {
+        return transaction.getId() + ":" + leg;
     }
 
     private TransferResponse runFullSaga(Transaction transaction) {
         try {
-            debitWithRetry(transaction.getSourceAccountId(), transaction.getAmount());
+            debitWithRetry(transaction.getSourceAccountId(),
+                    operationKeyFor(transaction, LEG_DEBIT), transaction.getAmount());
         } catch (RuntimeException debitFailure) {
             // Nothing external happened (the debit itself never took effect),
             // so there's nothing to compensate and nothing worth telling a
@@ -175,7 +201,8 @@ public class TransferService implements ITransferService {
 
     private TransferResponse runCreditAndFinish(Transaction transaction) {
         try {
-            creditWithRetry(transaction.getDestinationAccountId(), transaction.getAmount());
+            creditWithRetry(transaction.getDestinationAccountId(),
+                    operationKeyFor(transaction, LEG_CREDIT), transaction.getAmount());
         } catch (RuntimeException creditFailure) {
             return compensateAndMarkFailed(transaction, creditFailure);
         }
@@ -188,7 +215,8 @@ public class TransferService implements ITransferService {
         log.warn("Transfer {} failed at credit step ({}); compensating by crediting source {} back",
                 transaction.getId(), creditFailure.getMessage(), transaction.getSourceAccountId());
         try {
-            creditWithRetry(transaction.getSourceAccountId(), transaction.getAmount());
+            creditWithRetry(transaction.getSourceAccountId(),
+                    operationKeyFor(transaction, LEG_COMPENSATION), transaction.getAmount());
         } catch (RuntimeException compensationFailure) {
             // The worst case: money is stuck mid-transfer. In a real system
             // this should page someone, not just sit in COMPENSATION_FAILED.

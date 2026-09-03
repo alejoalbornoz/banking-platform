@@ -5,6 +5,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.MissingRequestHeaderException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
@@ -22,6 +23,16 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(ConflictException.class)
     public ResponseEntity<ErrorResponse> handleConflict(ConflictException ex, HttpServletRequest request) {
         return build(HttpStatus.CONFLICT, ex.getErrorCode(), ex.getMessage(), request, List.of());
+    }
+
+    /**
+     * Without this, a caller who forgets the required {@code Idempotency-Key}
+     * header would fall through to the catch-all below and get a 500 - telling
+     * them the server broke, when in fact their request did.
+     */
+    @ExceptionHandler(MissingRequestHeaderException.class)
+    public ResponseEntity<ErrorResponse> handleMissingHeader(MissingRequestHeaderException ex, HttpServletRequest request) {
+        return build(HttpStatus.BAD_REQUEST, "MISSING_HEADER", ex.getMessage(), request, List.of());
     }
 
     @ExceptionHandler(IllegalArgumentException.class)

@@ -29,10 +29,6 @@ spring:
     username: banking
     password: banking
 
-  tracing:
-    sampling:
-      probability: 1.0
-
 services:
   account-service:
     base-url: http://localhost:8081
@@ -50,6 +46,10 @@ management:
         include: health, info, metrics, prometheus
   tracing:
     enabled: true
+    # Sample every trace while the system is small; dial this down (e.g. 0.1)
+    # before this ever resembles production traffic.
+    sampling:
+      probability: 1.0
   zipkin:
     tracing:
       endpoint: http://localhost:9411/api/v2/spans
