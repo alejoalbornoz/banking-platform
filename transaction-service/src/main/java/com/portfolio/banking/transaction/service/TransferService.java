@@ -191,12 +191,12 @@ public class TransferService implements ITransferService {
             // so there's nothing to compensate and nothing worth telling a
             // downstream consumer about - no outbox event for this case.
             log.info("Transfer {} failed at debit step: {}", transaction.getId(), debitFailure.getMessage());
-            markFailedNoOutbox(transaction, debitFailure.getMessage());
-            return transactionMapper.toResponse(transaction);
+            Transaction failed = markFailedNoOutbox(transaction, debitFailure.getMessage());
+            return transactionMapper.toResponse(failed);
         }
 
-        markDebited(transaction);
-        return runCreditAndFinish(transaction);
+        Transaction debited = markDebited(transaction);
+        return runCreditAndFinish(debited);
     }
 
     private TransferResponse runCreditAndFinish(Transaction transaction) {
@@ -207,8 +207,8 @@ public class TransferService implements ITransferService {
             return compensateAndMarkFailed(transaction, creditFailure);
         }
 
-        markCompletedWithOutbox(transaction);
-        return transactionMapper.toResponse(transaction);
+        Transaction completed = markCompletedWithOutbox(transaction);
+        return transactionMapper.toResponse(completed);
     }
 
     private TransferResponse compensateAndMarkFailed(Transaction transaction, RuntimeException creditFailure) {
@@ -226,50 +226,73 @@ public class TransferService implements ITransferService {
             String reason = "Credit to destination failed (" + creditFailure.getMessage()
                     + ") and compensation also failed (" + compensationFailure.getMessage()
                     + "); manual intervention required";
-            markCompensationFailedWithOutbox(transaction, reason);
-            return transactionMapper.toResponse(transaction);
+            Transaction compensationFailed = markCompensationFailedWithOutbox(transaction, reason);
+            return transactionMapper.toResponse(compensationFailed);
         }
 
-        markFailedWithOutbox(transaction,
+        Transaction failed = markFailedWithOutbox(transaction,
                 "Credit to destination failed and was compensated: " + creditFailure.getMessage());
-        return transactionMapper.toResponse(transaction);
+        return transactionMapper.toResponse(failed);
     }
 
-    private void markDebited(Transaction transaction) {
-        transactionTemplate.executeWithoutResult(status -> {
+    /**
+     * Every {@code markX} method below returns the entity {@code save()}
+     * actually gives back, and every caller above threads that return value
+     * into whatever step comes next - never the parameter it started with.
+     * <p>
+     * That's not stylistic. {@code transaction} already has an id by the time
+     * any of these run, so {@code JpaRepository.save} performs a JPA
+     * {@code merge}, not a {@code persist}: it copies state onto a fresh
+     * managed instance and returns THAT - it does not update the version
+     * field on the detached object passed in. Discard that return value and
+     * keep mutating the original reference across a second
+     * {@code transactionTemplate} block, and its {@code @Version} is now
+     * stale relative to the row's real version after the first save. The
+     * next save's optimistic-lock check compares that stale version against
+     * the current row and fails with
+     * {@link org.springframework.orm.ObjectOptimisticLockingFailureException}
+     * - not because anything actually raced, but because a step that
+     * committed and moved the version on was never reflected back into the
+     * object every later step kept using.
+     */
+    private Transaction markDebited(Transaction transaction) {
+        return transactionTemplate.execute(status -> {
             transaction.markDebited();
-            transactionRepository.save(transaction);
+            return transactionRepository.save(transaction);
         });
     }
 
-    private void markFailedNoOutbox(Transaction transaction, String reason) {
-        transactionTemplate.executeWithoutResult(status -> {
+    private Transaction markFailedNoOutbox(Transaction transaction, String reason) {
+        return transactionTemplate.execute(status -> {
             transaction.markFailed(reason);
-            transactionRepository.save(transaction);
+            return transactionRepository.save(transaction);
         });
     }
 
-    private void markFailedWithOutbox(Transaction transaction, String reason) {
-        transactionTemplate.executeWithoutResult(status -> {
+    private Transaction markFailedWithOutbox(Transaction transaction, String reason) {
+        return transactionTemplate.execute(status -> {
             transaction.markFailed(reason);
-            transactionRepository.save(transaction);
-            writeOutboxEvent(transaction, ROUTING_KEY_FAILED, buildFailedEvent(transaction, reason));
+            Transaction saved = transactionRepository.save(transaction);
+            writeOutboxEvent(saved, ROUTING_KEY_FAILED, buildFailedEvent(saved, reason));
+            return saved;
         });
     }
 
-    private void markCompensationFailedWithOutbox(Transaction transaction, String reason) {
-        transactionTemplate.executeWithoutResult(status -> {
+    private Transaction markCompensationFailedWithOutbox(Transaction transaction, String reason) {
+        return transactionTemplate.execute(status -> {
             transaction.markCompensationFailed(reason);
-            transactionRepository.save(transaction);
-            writeOutboxEvent(transaction, ROUTING_KEY_FAILED, buildFailedEvent(transaction, reason));
+            Transaction saved = transactionRepository.save(transaction);
+            writeOutboxEvent(saved, ROUTING_KEY_FAILED, buildFailedEvent(saved, reason));
+            return saved;
         });
     }
 
-    private void markCompletedWithOutbox(Transaction transaction) {
-        transactionTemplate.executeWithoutResult(status -> {
+    private Transaction markCompletedWithOutbox(Transaction transaction) {
+        return transactionTemplate.execute(status -> {
             transaction.markCompleted();
-            transactionRepository.save(transaction);
-            writeOutboxEvent(transaction, ROUTING_KEY_COMPLETED, buildCompletedEvent(transaction));
+            Transaction saved = transactionRepository.save(transaction);
+            writeOutboxEvent(saved, ROUTING_KEY_COMPLETED, buildCompletedEvent(saved));
+            return saved;
         });
     }
 

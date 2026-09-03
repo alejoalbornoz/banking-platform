@@ -1,6 +1,10 @@
 package com.portfolio.banking.common.event;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.util.UUID;
 
 /**
@@ -25,9 +29,26 @@ public class TransferCompletedEvent extends DomainEvent {
     private final BigDecimal amount;
     private final String currency;
 
+    /** Used by a publisher creating a brand new event: mints a fresh eventId/occurredAt. */
     public TransferCompletedEvent(UUID transactionId, UUID sourceAccountId, UUID destinationAccountId,
                                    BigDecimal amount, String currency) {
-        super();
+        this(UUID.randomUUID(), Instant.now(), transactionId, sourceAccountId, destinationAccountId, amount, currency);
+    }
+
+    /**
+     * Used by Jackson to reconstruct this event on the consumer side, preserving
+     * the original {@code eventId} so redeliveries can be deduplicated. See
+     * {@link AccountCreatedEvent}'s matching constructor for why this exists.
+     */
+    @JsonCreator
+    public TransferCompletedEvent(@JsonProperty("eventId") UUID eventId,
+                                   @JsonProperty("occurredAt") Instant occurredAt,
+                                   @JsonProperty("transactionId") UUID transactionId,
+                                   @JsonProperty("sourceAccountId") UUID sourceAccountId,
+                                   @JsonProperty("destinationAccountId") UUID destinationAccountId,
+                                   @JsonProperty("amount") BigDecimal amount,
+                                   @JsonProperty("currency") String currency) {
+        super(eventId, occurredAt);
         this.transactionId = transactionId;
         this.sourceAccountId = sourceAccountId;
         this.destinationAccountId = destinationAccountId;

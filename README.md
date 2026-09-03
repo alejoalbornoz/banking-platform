@@ -27,7 +27,7 @@ design.
 |---|---|---|---|
 | `account-service` | 8081 | ✅ built | Accounts, balances. Source of truth for how much money exists. |
 | `transaction-service` | 8082 | ✅ built | Transfers between accounts: idempotency keys, saga + compensation, outbox pattern |
-| `notification-service` | 8083 | planned | Consumes events off RabbitMQ, sends async notifications |
+| `notification-service` | 8083 | ✅ built | Consumes account/transfer events off RabbitMQ, idempotently records notifications |
 | `auth-service` | 8084 | planned | User registration/login, JWT issuance |
 | `api-gateway` | 8080 | planned | Single entry point, routing |
 
@@ -47,13 +47,16 @@ design.
    mvn clean install
    ```
 
-3. Run the services (each in its own terminal). Both run their Flyway
+3. Run the services (each in its own terminal). All of them run their Flyway
    migrations automatically on startup:
    ```bash
    mvn -pl account-service spring-boot:run
    ```
    ```bash
    mvn -pl transaction-service spring-boot:run
+   ```
+   ```bash
+   mvn -pl notification-service spring-boot:run
    ```
 
 ## Trying the API
@@ -115,6 +118,19 @@ curl localhost:8082/api/v1/transfers/{transactionId}
 
 Traces for these requests show up in the Zipkin UI at http://localhost:9411 -
 a transfer produces one trace spanning both services.
+
+### notification-service (port 8083)
+
+Nothing to call directly - it only listens. Create an account or run a
+transfer above, then check what it recorded:
+
+```bash
+curl "localhost:8083/api/v1/notifications?accountId={accountId}"
+```
+
+A completed transfer produces two rows: one for the sender (`TRANSFER_SENT`)
+and one for the receiver (`TRANSFER_RECEIVED`), each queryable by their own
+account id.
 
 ## How concurrency is handled (account-service)
 
@@ -251,6 +267,54 @@ Polling is the simple implementation, which is the right call at this scale.
 Production systems at high throughput usually switch to change-data-capture
 (Debezium tailing the WAL) to avoid constantly `SELECT`ing the table.
 
+## Consuming idempotently, and dead-lettering what can't be handled (notification-service)
+
+Everything above guarantees an event gets published at least once. It says
+nothing about how many times a consumer *acts* on it - and "at least once
+delivery" plus "act on every delivery" is exactly how you'd double-notify (or,
+in a less forgiving handler, double-charge) someone. notification-service is
+where that risk actually lands, so it closes the loop the same way
+account-service's ledger closes it on the producer side: a unique constraint,
+not a check-then-act.
+
+Every event this service has ever handled gets one row in `processed_events`,
+keyed by the event's own `eventId` - not a generated one. Handling an event
+means, in one transaction: insert that row, then create whatever
+notifications the event implies. If the row already exists (a redelivery),
+the insert fails, the transaction rolls back, and the whole thing is treated
+as a no-op rather than an error. One event can produce more than one
+notification - a completed transfer notifies both the sender
+(`TRANSFER_SENT`) and the receiver (`TRANSFER_RECEIVED`) - but
+`processed_events` is what makes sure that pair is only ever created once no
+matter how many times the message shows up.
+
+This only works because `AccountCreatedEvent`, `TransferCompletedEvent`, and
+`TransferFailedEvent` can be faithfully reconstructed from JSON, `eventId`
+included. That wasn't true until this service needed it: each event class had
+exactly one public constructor, and it always minted a fresh `eventId` -
+correct for a publisher creating a new event, silently wrong for a consumer
+reconstructing one, since every redelivery would get a different id and
+"deduplicate by eventId" would never fire. Each class now has a second,
+`@JsonCreator`-annotated constructor for exactly that reconstruction.
+
+**Dispatch is by routing key, not by a type header.** account-service
+publishes via `Jackson2JsonMessageConverter`, which stamps a `__TypeId__`
+header naming its Java class; transaction-service's outbox relay sends
+pre-serialized JSON as raw bytes with no such header at all (a converter there
+would double-encode an already-serialized string). A consumer trusting that
+header would work against one publisher and break against the other, so
+`BankingEventListener` ignores it entirely and picks the target class from the
+routing key instead - the one thing both publishers reliably set.
+
+**A message this consumer can never process must not loop forever.**
+`notification-service.events.queue` is declared with `x-dead-letter-exchange`
+pointing at a fanout `banking.events.dlx`. The listener container retries a
+failing delivery a few times locally (fast, in-process, no broker round trip),
+and once those are exhausted, `RejectAndDontRequeueRecoverer` rejects the
+message without requeueing it - which, because of that queue argument, routes
+it to the dead-letter queue instead of either looping on this queue forever or
+disappearing silently.
+
 ## Known gaps
 
 Being explicit about what is *not* solved yet, since these are the interesting
@@ -265,14 +329,15 @@ parts:
   USD transfer between EUR accounts would go through. Doing this properly
   means deciding what multi-currency even means here (reject the mismatch, or
   introduce FX), which is its own piece of work.
-- **`transfer.failed` events aren't consumed by anything yet**, so a
-  `COMPENSATION_FAILED` transfer sits in the database instead of paging
-  someone.
+- **A `COMPENSATION_FAILED` transfer still just sits in the database.**
+  notification-service now records a `TRANSFER_FAILED` notification for it
+  like any other failure, but "a notification exists" isn't the same as
+  "someone got paged" - money genuinely stuck mid-transfer needs a real alert,
+  not a row a human has to think to go query for.
 - **No auth.** Every endpoint is open, and `ownerId` is trusted from the
   request body.
 
 ## Next steps
 
-- `notification-service` consuming `account.created` / `transfer.*` off RabbitMQ
 - `auth-service` + API gateway
 - Testcontainers-based integration tests

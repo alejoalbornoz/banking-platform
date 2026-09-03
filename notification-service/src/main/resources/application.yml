@@ -1,0 +1,57 @@
+server:
+  port: 8083
+
+spring:
+  application:
+    name: notification-service
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/notification_db
+    username: banking
+    password: banking
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      # Flyway owns the schema; Hibernate must never auto-generate DDL.
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: banking
+    password: banking
+
+banking:
+  rabbitmq:
+    exchange: banking.events
+    notification-queue: notification-service.events.queue
+    dead-letter-exchange: banking.events.dlx
+    dead-letter-queue: notification-service.events.dlq
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics, prometheus
+  tracing:
+    enabled: true
+    # Sample every trace while the system is small; dial this down (e.g. 0.1)
+    # before this ever resembles production traffic.
+    sampling:
+      probability: 1.0
+  zipkin:
+    tracing:
+      endpoint: http://localhost:9411/api/v2/spans
+
+logging:
+  pattern:
+    level: "%5p [${spring.application.name},%X{traceId:-},%X{spanId:-}]"

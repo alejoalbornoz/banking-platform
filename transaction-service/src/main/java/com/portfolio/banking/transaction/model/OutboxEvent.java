@@ -3,7 +3,6 @@ package com.portfolio.banking.transaction.model;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
-import jakarta.persistence.Lob;
 import jakarta.persistence.Table;
 import org.hibernate.annotations.CreationTimestamp;
 import org.hibernate.annotations.UuidGenerator;
@@ -39,8 +38,11 @@ public class OutboxEvent {
     @Column(name = "event_type", nullable = false, updatable = false, length = 100)
     private String eventType;
 
-    @Lob
-    @Column(nullable = false, updatable = false)
+    // Not @Lob: a JSON event payload is ordinary text, not a genuine "large
+    // object". On Postgres, Hibernate 6 maps a @Lob String to the oid large
+    // object type by default, which doesn't match the plain TEXT column the
+    // migration actually creates and fails schema validation on startup.
+    @Column(nullable = false, updatable = false, columnDefinition = "text")
     private String payload;
 
     @Column(nullable = false)

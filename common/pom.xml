@@ -15,8 +15,19 @@
     <name>common</name>
     <description>Event contracts shared across services for RabbitMQ messaging</description>
 
-    <!-- No dependencies for now: DTOs and exceptions live inside each
-         service instead of here (see account-service). This module only
-         holds event payload contracts, which genuinely must be identical
-         between a publisher and its consumers. -->
+    <!-- DTOs and exceptions live inside each service instead of here (see
+         account-service). This module only holds event payload contracts,
+         which genuinely must be identical between a publisher and its
+         consumers. -->
+    <dependencies>
+        <!-- Just the annotation types (@JsonCreator, @JsonProperty) used to
+             mark each event's wire-reconstruction constructor for consumers -
+             not the full jackson-databind, which this module has no other
+             reason to depend on. Version comes from the parent's imported
+             spring-boot-dependencies BOM. -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-annotations</artifactId>
+        </dependency>
+    </dependencies>
 </project>
