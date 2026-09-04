@@ -31,10 +31,41 @@
         <maven.compiler.parameters>true</maven.compiler.parameters>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <spring-boot.version>3.3.4</spring-boot.version>
+        <!-- Not managed by the imported spring-boot-dependencies BOM (that
+             only pins dependency versions, and we don't inherit
+             spring-boot-starter-parent's plugin management). Matched to
+             surefire's version so the two behave identically. -->
+        <maven-failsafe-plugin.version>3.2.5</maven-failsafe-plugin.version>
+        <!-- Newer than what spring-boot-dependencies:3.3.4 pins (1.19.8).
+             Doesn't fully fix it, but it's a strictly newer, otherwise
+             harmless version - see "Integration tests" in the README for
+             the actual Docker Desktop compatibility issue this project hits
+             on Windows. Spring Boot's BOM exposes this property for exactly
+             this kind of override; see the testcontainers-bom import below
+             for why the property alone isn't enough. -->
+        <testcontainers.version>1.21.3</testcontainers.version>
     </properties>
 
     <dependencyManagement>
         <dependencies>
+            <!-- Declared BEFORE spring-boot-dependencies so it wins on the
+                 shared org.testcontainers:* coordinates ("first import wins"
+                 for a given GA across multiple imported BOMs). Overriding the
+                 testcontainers.version property alone doesn't work here:
+                 spring-boot-dependencies pulls in testcontainers-bom via its
+                 OWN nested import, and that nested import is resolved (and
+                 the version placeholder baked into a concrete number) while
+                 building spring-boot-dependencies' own effective model,
+                 before our project ever sees it - a property we set has
+                 nothing left to substitute into by that point. Importing the
+                 BOM ourselves, ahead of it, is what actually wins. -->
+            <dependency>
+                <groupId>org.testcontainers</groupId>
+                <artifactId>testcontainers-bom</artifactId>
+                <version>${testcontainers.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
             <dependency>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-dependencies</artifactId>
@@ -59,7 +90,44 @@
                     <artifactId>spring-boot-maven-plugin</artifactId>
                     <version>${spring-boot.version}</version>
                 </plugin>
+                <!-- Version only, no executions here on purpose: the plugin
+                     lifecycle runs verify BEFORE install, so binding these
+                     executions unconditionally would make plain `mvn install`
+                     - the routine build command - start a Docker daemon on
+                     every run. The `integration-tests` profile below is what
+                     actually wires the goals in, opt-in only. -->
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-failsafe-plugin</artifactId>
+                    <version>${maven-failsafe-plugin.version}</version>
+                </plugin>
             </plugins>
         </pluginManagement>
     </build>
+
+    <profiles>
+        <!-- `mvn verify -Pintegration-tests` (or `install`/`package` with the
+             same flag) runs *IT.java classes against real Testcontainers.
+             Without this profile, `mvn test` and `mvn install` never touch
+             Docker at all - see "Integration tests" in the README. -->
+        <profile>
+            <id>integration-tests</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-failsafe-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <goals>
+                                    <goal>integration-test</goal>
+                                    <goal>verify</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

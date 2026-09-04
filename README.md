@@ -315,15 +315,66 @@ message without requeueing it - which, because of that queue argument, routes
 it to the dead-letter queue instead of either looping on this queue forever or
 disappearing silently.
 
+## Integration tests
+
+Unit tests use Mockito, which is enough for business logic but structurally
+can't exercise a few things that only exist once a real database and broker
+are involved: a genuine unique-constraint race under concurrent writers, a
+real `@Version` optimistic-lock conflict, whether the Flyway migrations
+actually apply cleanly, or whether a JPA mapping matches what Postgres
+actually has. Each service has an integration test suite for exactly that -
+and in this project's case, that's not hypothetical: running the full stack
+live for the first time surfaced a `@Lob`-on-a-TEXT-column mapping mismatch in
+`OutboxEvent` and a saga bug where `TransferService` reused a stale `@Version`
+across two saves, and unit tests had passed the whole time because a mocked
+`save()` just echoes its input instead of behaving like Hibernate's `merge()`.
+
+- `account-service`: `AccountConcurrencyIT` - fires N concurrent credit
+  requests at the same account, both with the same Idempotency-Key (must post
+  exactly once) and with distinct keys (all must apply, none lost to a lost
+  update).
+- `transaction-service`: `TransferSagaIT` - the saga against a real Postgres,
+  with only the HTTP call to account-service mocked, covering the happy path,
+  the compensation path, and resuming a transfer stuck at `DEBITED`.
+- `notification-service`: `NotificationConsumerIT` - publishes real messages
+  onto a real exchange and verifies consumption, idempotent redelivery, and
+  the retry-then-dead-letter path.
+
+These are `*IT.java` classes run by `maven-failsafe-plugin`, gated behind an
+`integration-tests` Maven profile that's off by default. `verify` runs before
+`install` in Maven's own lifecycle, so binding failsafe unconditionally would
+make plain `mvn install` - the routine build command - start a Docker daemon
+on every run; the profile keeps that opt-in:
+
+```bash
+mvn verify -Pintegration-tests
+```
+
+`mvn test` and plain `mvn install` never touch Docker at all, regardless of
+this profile.
+
+Each test class spins up its own Postgres and RabbitMQ via Testcontainers;
+`@ServiceConnection` wires them into `spring.datasource.*` /
+`spring.rabbitmq.*` automatically, no manual property plumbing.
+
+**Known issue: this profile on Windows with Docker Desktop.** On this
+project's own dev machine (Docker Desktop 4.82.0), running it fails outright
+- docker-java's connection probe gets a malformed, empty `400` response,
+whether it's dialed over the Windows named pipe or over Docker Desktop's
+"expose daemon on tcp://localhost:2375" option. Both appear to route through
+the same internal proxy, which has some incompatibility with the (fairly
+old) bundled docker-java client; bumping `<testcontainers.version>` in the
+root `pom.xml` didn't resolve it either. Running Maven from *inside* WSL2,
+talking to the Linux-native Docker socket directly instead of through Docker
+Desktop's Windows-side proxy, should sidestep this entirely, but that needs
+its own JDK/Maven install inside the distro and hasn't been tried. CI (no
+Docker Desktop, no proxy layer) is unaffected.
+
 ## Known gaps
 
 Being explicit about what is *not* solved yet, since these are the interesting
 parts:
 
-- **No integration tests yet.** Current tests are unit tests with Mockito.
-  Testcontainers (real Postgres + RabbitMQ) would cover the parts mocks can't:
-  the actual unique-constraint races under real concurrency, the Flyway
-  migrations, genuine optimistic-lock failures.
 - **Currency isn't validated across a transfer.** A transfer carries a
   currency, but nothing checks it against the two accounts' currencies, so a
   USD transfer between EUR accounts would go through. Doing this properly
@@ -340,4 +391,3 @@ parts:
 ## Next steps
 
 - `auth-service` + API gateway
-- Testcontainers-based integration tests
