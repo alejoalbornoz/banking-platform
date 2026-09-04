@@ -29,6 +29,11 @@ public class GlobalExceptionHandler {
         return build(HttpStatus.CONFLICT, ex.getErrorCode(), ex.getMessage(), request, List.of());
     }
 
+    @ExceptionHandler(ForbiddenException.class)
+    public ResponseEntity<ErrorResponse> handleForbidden(ForbiddenException ex, HttpServletRequest request) {
+        return build(HttpStatus.FORBIDDEN, ex.getErrorCode(), ex.getMessage(), request, List.of());
+    }
+
     /**
      * Without this, a caller who forgets the required {@code Idempotency-Key}
      * header would fall through to the catch-all below and get a 500 - telling

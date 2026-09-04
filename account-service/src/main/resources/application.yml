@@ -30,6 +30,15 @@ spring:
     username: banking
     password: banking
 
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # No secret configured here at all - Spring Security fetches and
+          # caches auth-service's public key set from this endpoint and
+          # validates every token's signature against it.
+          jwk-set-uri: http://localhost:8084/.well-known/jwks.json
+
 banking:
   rabbitmq:
     exchange: banking.events

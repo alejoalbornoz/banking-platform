@@ -30,6 +30,12 @@ spring:
     username: banking
     password: banking
 
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: http://localhost:8084/.well-known/jwks.json
+
 banking:
   rabbitmq:
     exchange: banking.events

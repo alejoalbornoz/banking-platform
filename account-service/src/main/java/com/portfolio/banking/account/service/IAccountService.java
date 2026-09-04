@@ -10,7 +10,7 @@ import java.util.UUID;
 
 public interface IAccountService {
 
-    AccountResponse createAccount(CreateAccountRequest request);
+    AccountResponse createAccount(UUID ownerId, CreateAccountRequest request);
 
     AccountResponse getAccount(UUID accountId);
 

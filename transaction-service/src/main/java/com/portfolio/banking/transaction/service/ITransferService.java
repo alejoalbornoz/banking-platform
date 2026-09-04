@@ -14,10 +14,18 @@ public interface ITransferService {
      * call, subsequent calls return the stored result without re-executing
      * anything against account-service.
      *
+     * @param callerId the authenticated caller's subject (from their JWT) -
+     *                  must own {@code request.sourceAccountId()}
+     * @throws com.portfolio.banking.transaction.exception.ForbiddenException
+     *         if the caller doesn't own the source account
      * @throws com.portfolio.banking.transaction.exception.IdempotencyKeyReusedException
      *         if {@code idempotencyKey} was already used for a different request
      */
-    TransferResponse transfer(String idempotencyKey, TransferRequest request);
+    TransferResponse transfer(String callerId, String idempotencyKey, TransferRequest request);
 
-    TransferResponse getTransaction(UUID transactionId);
+    /**
+     * @throws com.portfolio.banking.transaction.exception.ForbiddenException
+     *         if the caller owns neither the source nor the destination account
+     */
+    TransferResponse getTransaction(String callerId, UUID transactionId);
 }

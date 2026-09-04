@@ -5,18 +5,16 @@ import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
 
 import java.math.BigDecimal;
-import java.util.UUID;
 
 /**
- * @param ownerId        id of the account holder (will point at the Auth
- *                        service's user id once that service exists)
+ * Deliberately carries no owner identifier: the account being created always
+ * belongs to whoever is authenticated, taken from the caller's JWT, not
+ * something a client gets to assert about itself.
+ *
  * @param openingBalance defaults to zero at the controller if not supplied
  * @param currency       ISO 4217 currency code, e.g. "USD"
  */
 public record CreateAccountRequest(
-
-        @NotNull(message = "ownerId is required")
-        UUID ownerId,
 
         @NotNull(message = "openingBalance is required")
         @DecimalMin(value = "0.00", message = "openingBalance cannot be negative")

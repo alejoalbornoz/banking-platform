@@ -1,5 +1,6 @@
 package com.portfolio.banking.transaction.client;
 
+import com.portfolio.banking.transaction.client.dto.AccountView;
 import com.portfolio.banking.transaction.client.dto.AmountClientRequest;
 import com.portfolio.banking.transaction.client.dto.RemoteErrorResponse;
 import com.portfolio.banking.transaction.exception.InsufficientFundsException;
@@ -33,6 +34,18 @@ public class AccountClient implements IAccountClient {
     @Override
     public void credit(UUID accountId, String operationKey, BigDecimal amount) {
         call(accountId, operationKey, amount, "credit");
+    }
+
+    @Override
+    public AccountView getAccount(UUID accountId) {
+        try {
+            return restClient.get()
+                    .uri("/api/v1/accounts/{id}", accountId)
+                    .retrieve()
+                    .body(AccountView.class);
+        } catch (RestClientResponseException ex) {
+            throw mapRemoteError(accountId, ex);
+        }
     }
 
     private void call(UUID accountId, String operationKey, BigDecimal amount, String operation) {

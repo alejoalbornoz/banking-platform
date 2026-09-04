@@ -42,6 +42,17 @@
             <artifactId>spring-boot-starter-amqp</artifactId>
         </dependency>
 
+        <!-- Validates JWTs issued by auth-service against its published
+             JWK set - no secret ever shared between the two services. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+        </dependency>
+
         <!-- Tracing: Micrometer Tracing bridged to Zipkin -->
         <dependency>
             <groupId>io.micrometer</groupId>

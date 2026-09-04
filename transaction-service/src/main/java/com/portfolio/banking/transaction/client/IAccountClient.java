@@ -1,5 +1,7 @@
 package com.portfolio.banking.transaction.client;
 
+import com.portfolio.banking.transaction.client.dto.AccountView;
+
 import java.math.BigDecimal;
 import java.util.UUID;
 
@@ -29,4 +31,12 @@ public interface IAccountClient {
      * @throws com.portfolio.banking.transaction.exception.RemoteConcurrencyException account-service's own retries were exhausted
      */
     void credit(UUID accountId, String operationKey, BigDecimal amount);
+
+    /**
+     * Used only to check who owns an account before initiating or looking up
+     * a transfer - never on its own as a user-facing operation.
+     *
+     * @throws com.portfolio.banking.transaction.exception.ResourceNotFoundException account doesn't exist
+     */
+    AccountView getAccount(UUID accountId);
 }

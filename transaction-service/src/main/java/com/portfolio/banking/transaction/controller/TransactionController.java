@@ -6,6 +6,8 @@ import com.portfolio.banking.transaction.service.ITransferService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -27,15 +29,16 @@ public class TransactionController {
     }
 
     @PostMapping
-    public ResponseEntity<TransferResponse> transfer(@RequestHeader("Idempotency-Key") String idempotencyKey,
+    public ResponseEntity<TransferResponse> transfer(@AuthenticationPrincipal Jwt caller,
+                                                       @RequestHeader("Idempotency-Key") String idempotencyKey,
                                                        @Valid @RequestBody TransferRequest request) {
-        TransferResponse response = transferService.transfer(idempotencyKey, request);
+        TransferResponse response = transferService.transfer(caller.getSubject(), idempotencyKey, request);
         return ResponseEntity.status(statusFor(response)).body(response);
     }
 
     @GetMapping("/{transactionId}")
-    public TransferResponse getTransaction(@PathVariable UUID transactionId) {
-        return transferService.getTransaction(transactionId);
+    public TransferResponse getTransaction(@AuthenticationPrincipal Jwt caller, @PathVariable UUID transactionId) {
+        return transferService.getTransaction(caller.getSubject(), transactionId);
     }
 
     /** 201 when this call is the one that completed the transfer; 200 for anything else (failed, or a replayed result). */

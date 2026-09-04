@@ -4,8 +4,10 @@ import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.portfolio.banking.transaction.client.IAccountClient;
+import com.portfolio.banking.transaction.client.dto.AccountView;
 import com.portfolio.banking.transaction.dto.TransferRequest;
 import com.portfolio.banking.transaction.dto.TransferResponse;
+import com.portfolio.banking.transaction.exception.ForbiddenException;
 import com.portfolio.banking.transaction.exception.IdempotencyKeyReusedException;
 import com.portfolio.banking.transaction.exception.InsufficientFundsException;
 import com.portfolio.banking.transaction.exception.ResourceNotFoundException;
@@ -63,6 +65,8 @@ class TransferServiceTest {
     private final UUID destinationId = UUID.randomUUID();
     private final BigDecimal amount = new BigDecimal("50.00");
     private final TransferRequest request = new TransferRequest(sourceId, destinationId, amount, "USD");
+    private final UUID ownerId = UUID.randomUUID();
+    private final String callerId = ownerId.toString();
 
     @BeforeEach
     void setUp() {
@@ -92,6 +96,11 @@ class TransferServiceTest {
 
         lenient().when(transactionRepository.save(any(Transaction.class))).thenAnswer(inv -> inv.getArgument(0));
 
+        // Every transfer() call checks the caller owns the source account
+        // before doing anything else - lenient() since the self-transfer
+        // test rejects the request before this is ever consulted.
+        lenient().when(accountClient.getAccount(sourceId)).thenReturn(new AccountView(sourceId, ownerId));
+
         transferService = new TransferService(
                 transactionRepository, outboxEventRepository, transactionMapper,
                 accountClient, retryTemplate, transactionTemplate, objectMapper);
@@ -101,7 +110,7 @@ class TransferServiceTest {
     void transfer_happyPath_completesAndWritesOutboxEvent() {
         when(transactionRepository.findByIdempotencyKey("key-1")).thenReturn(Optional.empty());
 
-        TransferResponse response = transferService.transfer("key-1", request);
+        TransferResponse response = transferService.transfer(callerId, "key-1", request);
 
         assertThat(response.status()).isEqualTo("COMPLETED");
         verify(accountClient).debit(eq(sourceId), anyString(), eq(amount));
@@ -135,7 +144,7 @@ class TransferServiceTest {
         doThrow(new InsufficientFundsException("not enough balance"))
                 .when(accountClient).debit(eq(sourceId), anyString(), eq(amount));
 
-        TransferResponse response = transferService.transfer("key-2", request);
+        TransferResponse response = transferService.transfer(callerId, "key-2", request);
 
         assertThat(response.status()).isEqualTo("FAILED");
         assertThat(response.failureReason()).contains("not enough balance");
@@ -151,7 +160,7 @@ class TransferServiceTest {
                 .when(accountClient).credit(eq(destinationId), anyString(), eq(amount));
         doNothing().when(accountClient).credit(eq(sourceId), anyString(), eq(amount)); // the compensation call succeeds
 
-        TransferResponse response = transferService.transfer("key-3", request);
+        TransferResponse response = transferService.transfer(callerId, "key-3", request);
 
         assertThat(response.status()).isEqualTo("FAILED");
         assertThat(response.failureReason()).contains("compensated");
@@ -172,7 +181,7 @@ class TransferServiceTest {
         doThrow(new ResourceNotFoundException("source account vanished too"))
                 .when(accountClient).credit(eq(sourceId), anyString(), eq(amount));
 
-        TransferResponse response = transferService.transfer("key-4", request);
+        TransferResponse response = transferService.transfer(callerId, "key-4", request);
 
         assertThat(response.status()).isEqualTo("COMPENSATION_FAILED");
         assertThat(response.failureReason()).contains("manual intervention required");
@@ -184,7 +193,7 @@ class TransferServiceTest {
         alreadyCompleted.markCompleted();
         when(transactionRepository.findByIdempotencyKey("key-5")).thenReturn(Optional.of(alreadyCompleted));
 
-        TransferResponse response = transferService.transfer("key-5", request);
+        TransferResponse response = transferService.transfer(callerId, "key-5", request);
 
         assertThat(response.status()).isEqualTo("COMPLETED");
         verify(accountClient, never()).debit(any(), any(), any());
@@ -197,7 +206,7 @@ class TransferServiceTest {
                 new Transaction("key-6", sourceId, destinationId, new BigDecimal("999.00"), "USD");
         when(transactionRepository.findByIdempotencyKey("key-6")).thenReturn(Optional.of(existingWithDifferentAmount));
 
-        assertThatThrownBy(() -> transferService.transfer("key-6", request))
+        assertThatThrownBy(() -> transferService.transfer(callerId, "key-6", request))
                 .isInstanceOf(IdempotencyKeyReusedException.class);
     }
 
@@ -209,7 +218,7 @@ class TransferServiceTest {
         debited.markDebited();
         when(transactionRepository.findByIdempotencyKey("key-7")).thenReturn(Optional.of(debited));
 
-        TransferResponse response = transferService.transfer("key-7", request);
+        TransferResponse response = transferService.transfer(callerId, "key-7", request);
 
         assertThat(response.status()).isEqualTo("COMPLETED");
         verify(accountClient, never()).debit(any(), any(), any());
@@ -220,7 +229,7 @@ class TransferServiceTest {
     void transfer_sourceEqualsDestination_throwsIllegalArgumentException() {
         TransferRequest selfTransfer = new TransferRequest(sourceId, sourceId, amount, "USD");
 
-        assertThatThrownBy(() -> transferService.transfer("key-8", selfTransfer))
+        assertThatThrownBy(() -> transferService.transfer(callerId, "key-8", selfTransfer))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
@@ -228,7 +237,7 @@ class TransferServiceTest {
     void transfer_sendsDistinctOperationKeysDerivedFromTheTransactionId() {
         when(transactionRepository.findByIdempotencyKey("key-9")).thenReturn(Optional.empty());
 
-        transferService.transfer("key-9", request);
+        transferService.transfer(callerId, "key-9", request);
 
         ArgumentCaptor<String> debitKey = ArgumentCaptor.forClass(String.class);
         ArgumentCaptor<String> creditKey = ArgumentCaptor.forClass(String.class);
@@ -251,7 +260,7 @@ class TransferServiceTest {
                 .when(accountClient).credit(eq(destinationId), anyString(), eq(amount));
         doNothing().when(accountClient).credit(eq(sourceId), anyString(), eq(amount));
 
-        transferService.transfer("key-10", request);
+        transferService.transfer(callerId, "key-10", request);
 
         ArgumentCaptor<String> debitKey = ArgumentCaptor.forClass(String.class);
         ArgumentCaptor<String> compensationKey = ArgumentCaptor.forClass(String.class);
@@ -264,5 +273,44 @@ class TransferServiceTest {
         // would never come back.
         assertThat(compensationKey.getValue()).isNotEqualTo(debitKey.getValue());
         assertThat(compensationKey.getValue()).endsWith(":compensation");
+    }
+
+    @Test
+    void transfer_callerDoesNotOwnSourceAccount_throwsForbiddenBeforeTouchingAccountService() {
+        String someoneElse = UUID.randomUUID().toString();
+
+        assertThatThrownBy(() -> transferService.transfer(someoneElse, "key-11", request))
+                .isInstanceOf(ForbiddenException.class);
+        verify(accountClient, never()).debit(any(), any(), any());
+        verify(accountClient, never()).credit(any(), any(), any());
+        verify(transactionRepository, never()).save(any());
+    }
+
+    @Test
+    void getTransaction_callerOwnsSource_returnsIt() {
+        UUID transactionId = UUID.randomUUID();
+        Transaction completed = new Transaction("key-12", sourceId, destinationId, amount, "USD");
+        completed.markDebited();
+        completed.markCompleted();
+        when(transactionRepository.findById(transactionId)).thenReturn(Optional.of(completed));
+
+        TransferResponse response = transferService.getTransaction(callerId, transactionId);
+
+        assertThat(response.status()).isEqualTo("COMPLETED");
+    }
+
+    @Test
+    void getTransaction_callerOwnsNeitherAccount_throwsForbidden() {
+        UUID transactionId = UUID.randomUUID();
+        Transaction completed = new Transaction("key-13", sourceId, destinationId, amount, "USD");
+        completed.markDebited();
+        completed.markCompleted();
+        when(transactionRepository.findById(transactionId)).thenReturn(Optional.of(completed));
+        when(accountClient.getAccount(destinationId))
+                .thenReturn(new AccountView(destinationId, UUID.randomUUID()));
+
+        String someoneElse = UUID.randomUUID().toString();
+        assertThatThrownBy(() -> transferService.getTransaction(someoneElse, transactionId))
+                .isInstanceOf(ForbiddenException.class);
     }
 }

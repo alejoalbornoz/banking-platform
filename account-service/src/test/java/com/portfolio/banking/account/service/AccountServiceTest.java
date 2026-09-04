@@ -108,11 +108,11 @@ class AccountServiceTest {
 
     @Test
     void createAccount_persistsAndReturnsAccount() {
-        CreateAccountRequest request = new CreateAccountRequest(ownerId, new BigDecimal("100.00"), "USD");
+        CreateAccountRequest request = new CreateAccountRequest(new BigDecimal("100.00"), "USD");
         when(accountRepository.existsByAccountNumber(anyString())).thenReturn(false);
         when(accountRepository.saveAndFlush(any(Account.class))).thenAnswer(inv -> inv.getArgument(0));
 
-        AccountResponse response = accountService.createAccount(request);
+        AccountResponse response = accountService.createAccount(ownerId, request);
 
         assertThat(response.ownerId()).isEqualTo(ownerId);
         assertThat(response.balance()).isEqualByComparingTo("100.00");
@@ -123,11 +123,11 @@ class AccountServiceTest {
 
     @Test
     void createAccount_withOpeningBalance_recordsItInTheLedger() {
-        CreateAccountRequest request = new CreateAccountRequest(ownerId, new BigDecimal("100.00"), "USD");
+        CreateAccountRequest request = new CreateAccountRequest(new BigDecimal("100.00"), "USD");
         when(accountRepository.existsByAccountNumber(anyString())).thenReturn(false);
         when(accountRepository.saveAndFlush(any(Account.class))).thenAnswer(inv -> inv.getArgument(0));
 
-        accountService.createAccount(request);
+        accountService.createAccount(ownerId, request);
 
         // Without this entry the account's balance would have no explanation in
         // the ledger, and it would fail reconciliation from the moment it opened.
@@ -142,11 +142,11 @@ class AccountServiceTest {
 
     @Test
     void createAccount_withZeroOpeningBalance_recordsNoLedgerEntry() {
-        CreateAccountRequest request = new CreateAccountRequest(ownerId, BigDecimal.ZERO, "USD");
+        CreateAccountRequest request = new CreateAccountRequest(BigDecimal.ZERO, "USD");
         when(accountRepository.existsByAccountNumber(anyString())).thenReturn(false);
         when(accountRepository.saveAndFlush(any(Account.class))).thenAnswer(inv -> inv.getArgument(0));
 
-        accountService.createAccount(request);
+        accountService.createAccount(ownerId, request);
 
         // An empty ledger already sums to zero, so there is nothing to record -
         // and a zero-amount entry would violate the amount > 0 constraint.

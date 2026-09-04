@@ -64,10 +64,10 @@ public class AccountService implements IAccountService {
 
     @Override
     @Transactional
-    public AccountResponse createAccount(CreateAccountRequest request) {
+    public AccountResponse createAccount(UUID ownerId, CreateAccountRequest request) {
         Account account = new Account(
                 generateUniqueAccountNumber(),
-                request.ownerId(),
+                ownerId,
                 request.openingBalance(),
                 request.currency()
         );

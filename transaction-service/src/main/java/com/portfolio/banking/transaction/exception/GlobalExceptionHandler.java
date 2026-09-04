@@ -29,6 +29,11 @@ public class GlobalExceptionHandler {
         return build(HttpStatus.CONFLICT, ex.getErrorCode(), ex.getMessage(), request, List.of());
     }
 
+    @ExceptionHandler(ForbiddenException.class)
+    public ResponseEntity<ErrorResponse> handleForbidden(ForbiddenException ex, HttpServletRequest request) {
+        return build(HttpStatus.FORBIDDEN, ex.getErrorCode(), ex.getMessage(), request, List.of());
+    }
+
     @ExceptionHandler(MissingRequestHeaderException.class)
     public ResponseEntity<ErrorResponse> handleMissingHeader(MissingRequestHeaderException ex, HttpServletRequest request) {
         return build(HttpStatus.BAD_REQUEST, "MISSING_HEADER", ex.getMessage(), request, List.of());

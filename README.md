@@ -11,6 +11,7 @@ design.
 - Java 21, Spring Boot 3.3
 - PostgreSQL (database-per-service), Flyway migrations
 - RabbitMQ for async, event-driven communication between services
+- Spring Security (OAuth2 resource server) + Spring Cloud Gateway for JWT-based auth and routing
 - Micrometer Tracing + Zipkin for distributed tracing
 - JUnit 5 + Mockito for testing
 - Docker Compose for local infrastructure
@@ -28,8 +29,8 @@ design.
 | `account-service` | 8081 | ✅ built | Accounts, balances. Source of truth for how much money exists. |
 | `transaction-service` | 8082 | ✅ built | Transfers between accounts: idempotency keys, saga + compensation, outbox pattern |
 | `notification-service` | 8083 | ✅ built | Consumes account/transfer events off RabbitMQ, idempotently records notifications |
-| `auth-service` | 8084 | planned | User registration/login, JWT issuance |
-| `api-gateway` | 8080 | planned | Single entry point, routing |
+| `auth-service` | 8084 | ✅ built | User registration/login, JWT issuance, JWKS publishing |
+| `api-gateway` | 8080 | ✅ built | Single entry point, path-based routing |
 
 ## Running locally
 
@@ -48,7 +49,12 @@ design.
    ```
 
 3. Run the services (each in its own terminal). All of them run their Flyway
-   migrations automatically on startup:
+   migrations automatically on startup. Start `auth-service` first - the
+   other three fetch its public key set on first use, and `api-gateway` just
+   routes to whichever of the four are up:
+   ```bash
+   mvn -pl auth-service spring-boot:run
+   ```
    ```bash
    mvn -pl account-service spring-boot:run
    ```
@@ -58,74 +64,92 @@ design.
    ```bash
    mvn -pl notification-service spring-boot:run
    ```
+   ```bash
+   mvn -pl api-gateway spring-boot:run
+   ```
 
 ## Trying the API
 
-### account-service (port 8081)
+Everything below goes through the gateway on port 8080, and (`auth-service`'s
+own endpoints aside) needs an `Authorization: Bearer <token>` header from
+here on - every other service now validates it.
+
+### auth-service: register and log in
+
+```bash
+curl -X POST localhost:8080/api/v1/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"password123"}'
+
+# Copy the accessToken from the response for every call below.
+curl -X POST localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"password123"}'
+```
+
+### account-service
+
+`ownerId` is never in the request - it's taken from the token, so the account
+you create always belongs to whoever's logged in:
 
 ```bash
 # Create an account
-curl -X POST localhost:8081/api/v1/accounts \
+curl -X POST localhost:8080/api/v1/accounts \
   -H "Content-Type: application/json" \
-  -d '{"ownerId":"11111111-1111-1111-1111-111111111111","openingBalance":100.00,"currency":"USD"}'
+  -H "Authorization: Bearer {token}" \
+  -d '{"openingBalance":100.00,"currency":"USD"}'
 
-# Fetch it (replace {id} with the id returned above)
-curl localhost:8081/api/v1/accounts/{id}
+# Fetch it (replace {id} with the id returned above) - 403 if it isn't yours
+curl localhost:8080/api/v1/accounts/{id} -H "Authorization: Bearer {token}"
 
-# Credit it. Idempotency-Key is required on anything that moves money.
-curl -X POST localhost:8081/api/v1/accounts/{id}/credit \
-  -H "Content-Type: application/json" \
-  -H "Idempotency-Key: deposit-001" \
-  -d '{"amount":50.00}'
-
-# Debit it
-curl -X POST localhost:8081/api/v1/accounts/{id}/debit \
-  -H "Content-Type: application/json" \
-  -H "Idempotency-Key: withdrawal-001" \
-  -d '{"amount":30.00}'
-
-# List an owner's accounts
-curl "localhost:8081/api/v1/accounts?ownerId=11111111-1111-1111-1111-111111111111"
+# List your own accounts
+curl localhost:8080/api/v1/accounts -H "Authorization: Bearer {token}"
 
 # Read the statement, with the balance recomputed from the entries
-curl localhost:8081/api/v1/accounts/{id}/ledger
+curl localhost:8080/api/v1/accounts/{id}/ledger -H "Authorization: Bearer {token}"
 ```
 
-Run the credit command twice. The balance goes up **once** - the second call
-finds the key already posted and replays the result. Reuse `deposit-001` with a
-different amount and you get `409 OPERATION_KEY_REUSED`.
+`POST /credit` and `/debit` still exist, but they're `ROLE_SERVICE`-only now -
+calling them with a user token gets a 403. Move money via a transfer instead;
+see "Authentication" below for why crediting an account you don't own can
+never pass an ownership check, and how transaction-service gets around it.
 
-### transaction-service (port 8082)
+### transaction-service
 
-Create two accounts first, then transfer between them. The `Idempotency-Key`
-header is **required**:
+Create two accounts (as two different users, or reuse one for both sides
+except source/destination can't match) then transfer between them. Both the
+`Idempotency-Key` header and owning the source account are required:
 
 ```bash
-curl -X POST localhost:8082/api/v1/transfers \
+curl -X POST localhost:8080/api/v1/transfers \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer {token}" \
   -H "Idempotency-Key: 3f9a1c7e-0001-4a2b-9c3d-000000000001" \
   -d '{"sourceAccountId":"{sourceId}","destinationAccountId":"{destId}","amount":25.00,"currency":"USD"}'
 ```
 
 Send that exact command a second time and the money moves **once**: the second
 call replays the stored result instead of transferring again. Change the amount
-but keep the same key and you get `409 IDEMPOTENCY_KEY_REUSED`.
+but keep the same key and you get `409 IDEMPOTENCY_KEY_REUSED`. Try it with a
+`sourceAccountId` you don't own and you get `403 FORBIDDEN` before anything
+happens.
 
 ```bash
-# Look up a transfer's final state
-curl localhost:8082/api/v1/transfers/{transactionId}
+# Look up a transfer's final state (you must own the source or destination)
+curl localhost:8080/api/v1/transfers/{transactionId} -H "Authorization: Bearer {token}"
 ```
 
 Traces for these requests show up in the Zipkin UI at http://localhost:9411 -
 a transfer produces one trace spanning both services.
 
-### notification-service (port 8083)
+### notification-service
 
 Nothing to call directly - it only listens. Create an account or run a
-transfer above, then check what it recorded:
+transfer above, then check what it recorded (any authenticated caller can
+read any `accountId` here - see "Known gaps"):
 
 ```bash
-curl "localhost:8083/api/v1/notifications?accountId={accountId}"
+curl "localhost:8080/api/v1/notifications?accountId={accountId}" -H "Authorization: Bearer {token}"
 ```
 
 A completed transfer produces two rows: one for the sender (`TRANSFER_SENT`)
@@ -315,6 +339,66 @@ message without requeueing it - which, because of that queue argument, routes
 it to the dead-letter queue instead of either looping on this queue forever or
 disappearing silently.
 
+## Authentication (auth-service, api-gateway)
+
+Every endpoint used to be open, and `ownerId` was trusted straight from the
+request body - anyone who knew (or guessed) an account's UUID could read its
+balance, credit it, or debit it. `auth-service` and per-service Spring
+Security resource-server config close that.
+
+**RS256 + JWKS, not a shared secret.** `auth-service` generates a 2048-bit RSA
+keypair once at startup and publishes the public half at
+`GET /.well-known/jwks.json`. account-service, transaction-service, and
+notification-service each point `spring.security.oauth2.resourceserver.jwt.jwk-set-uri`
+there and validate every token's signature against it - no secret is ever
+copied into more than one service's config, unlike the shared `banking`/
+`banking` Postgres and RabbitMQ credentials this project otherwise uses for
+simplicity. The keypair is **ephemeral, generated fresh on every restart** -
+a deliberate simplification for a portfolio project, not an oversight.
+Restarting auth-service invalidates every token issued by the previous
+instance, since the new instance publishes a different public key. A real
+deployment would persist the keypair (a KMS, a mounted secret) so a restart
+doesn't log everyone out.
+
+**Two kinds of token, one claim that tells them apart.** Logging in mints a
+token with `sub` = the user's id and `role=USER`. `POST /api/v1/auth/service-token`
+(client-id/secret from config - `banking.security.service-clients` in
+auth-service's `application.yml` - not the `users` table, since a service
+credential isn't a human account) mints one with `role=SERVICE` instead. Every
+resource server maps that claim to a `ROLE_*` Spring Security authority via a
+small custom `JwtAuthenticationConverter` (the claim is a plain string, not
+the space-delimited `scope`/`scp` list Spring Security's default converter
+expects).
+
+**Why account-service needs a service role at all.** A transfer credits the
+*destination* account, which by definition doesn't belong to whoever
+initiated the transfer - "does the caller own this account" can never be the
+right check for that call. So `account-service`'s `/credit` and `/debit` are
+`ROLE_SERVICE`-only, not reachable by an end user at all any more; only
+transaction-service calls them, using a service token it obtains once from
+auth-service and caches (`ServiceTokenProvider`), attached to every outgoing
+call via a `RestClient` request interceptor
+(`RestClientConfig.accountServiceRestClient`). That same token lets
+transaction-service call `GET /accounts/{id}` to look up who owns an account
+before initiating or returning a transfer - the one case where a
+service-role caller legitimately needs to read *any* account, not just its
+own.
+
+**Everywhere else, ownership is checked in the controller, not the URL
+pattern.** `GET /accounts/{id}`, `/accounts/number/{n}`, and `/ledger` all
+fetch the account first, then compare its `ownerId` to the caller's JWT
+`sub` (or accept a `ROLE_SERVICE` caller) - a route-matching rule has no way
+to know who owns a specific row before it's read. `transaction-service`
+follows the same pattern for `/transfers`: it fetches the source account's
+owner via its service token and rejects the request before the saga ever
+starts if the caller isn't it.
+
+**`api-gateway` is pure routing.** It doesn't validate JWTs itself - each of
+the four services behind it is already a proper resource server, so a second
+check at the gateway would just duplicate the same validation against the
+same JWKS, not add a real second line of defense. It only exists so a client
+has one base URL and port (8080) instead of four.
+
 ## Integration tests
 
 Unit tests use Mockito, which is enough for business logic but structurally
@@ -385,9 +469,15 @@ parts:
   like any other failure, but "a notification exists" isn't the same as
   "someone got paged" - money genuinely stuck mid-transfer needs a real alert,
   not a row a human has to think to go query for.
-- **No auth.** Every endpoint is open, and `ownerId` is trusted from the
-  request body.
-
-## Next steps
-
-- `auth-service` + API gateway
+- **notification-service doesn't verify the caller owns the `accountId`
+  they're querying** - only that they're authenticated. Closing this needs
+  the same `getAccount`-plus-service-token machinery just built for
+  transaction-service, which felt like too much duplicated ceremony to add
+  to a service that didn't previously have any exception-handling
+  infrastructure of its own, for this pass.
+- **No refresh tokens or revocation.** A leaked token is valid until it
+  expires (1 hour for a user token, 12 for a service token) - there's no way
+  to invalidate one early short of restarting auth-service, which invalidates
+  every outstanding token, not just the one you wanted to revoke.
+- **auth-service's signing key doesn't survive a restart** - see
+  "Authentication" above. Fine for a demo, not for anything real.

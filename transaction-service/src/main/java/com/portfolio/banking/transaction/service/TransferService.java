@@ -7,6 +7,7 @@ import com.portfolio.banking.common.event.TransferFailedEvent;
 import com.portfolio.banking.transaction.client.IAccountClient;
 import com.portfolio.banking.transaction.dto.TransferRequest;
 import com.portfolio.banking.transaction.dto.TransferResponse;
+import com.portfolio.banking.transaction.exception.ForbiddenException;
 import com.portfolio.banking.transaction.exception.IdempotencyKeyReusedException;
 import com.portfolio.banking.transaction.exception.ResourceNotFoundException;
 import com.portfolio.banking.transaction.mapper.ITransactionMapper;
@@ -86,10 +87,11 @@ public class TransferService implements ITransferService {
     }
 
     @Override
-    public TransferResponse transfer(String idempotencyKey, TransferRequest request) {
+    public TransferResponse transfer(String callerId, String idempotencyKey, TransferRequest request) {
         if (request.sourceAccountId().equals(request.destinationAccountId())) {
             throw new IllegalArgumentException("sourceAccountId and destinationAccountId must differ");
         }
+        assertCallerOwnsAccount(callerId, request.sourceAccountId());
 
         Transaction transaction = findOrCreate(idempotencyKey, request);
 
@@ -110,10 +112,32 @@ public class TransferService implements ITransferService {
 
     @Override
     @Transactional(readOnly = true)
-    public TransferResponse getTransaction(UUID transactionId) {
+    public TransferResponse getTransaction(String callerId, UUID transactionId) {
         Transaction transaction = transactionRepository.findById(transactionId)
                 .orElseThrow(() -> ResourceNotFoundException.forEntity("Transaction", transactionId));
+        if (!ownsAccount(callerId, transaction.getSourceAccountId())
+                && !ownsAccount(callerId, transaction.getDestinationAccountId())) {
+            throw new ForbiddenException("Not authorized to view this transfer");
+        }
         return transactionMapper.toResponse(transaction);
+    }
+
+    /**
+     * Fetches the account's owner via account-service (using this service's
+     * own service credential - see {@code ServiceTokenProvider}) and compares
+     * it against the caller's own JWT subject. Only the source account needs
+     * this check before a transfer starts: the destination is never expected
+     * to belong to the caller, that's the entire point of sending money to
+     * someone else.
+     */
+    private void assertCallerOwnsAccount(String callerId, UUID accountId) {
+        if (!ownsAccount(callerId, accountId)) {
+            throw new ForbiddenException("Not authorized to transfer from account " + accountId);
+        }
+    }
+
+    private boolean ownsAccount(String callerId, UUID accountId) {
+        return callerId.equals(accountClient.getAccount(accountId).ownerId().toString());
     }
 
     private Transaction findOrCreate(String idempotencyKey, TransferRequest request) {

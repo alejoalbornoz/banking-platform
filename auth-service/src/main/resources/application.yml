@@ -1,0 +1,62 @@
+server:
+  port: 8084
+
+spring:
+  application:
+    name: auth-service
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/auth_db
+    username: banking
+    password: banking
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      # Flyway owns the schema; Hibernate must never auto-generate DDL.
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+banking:
+  jwt:
+    # Tokens a human logs in with. Short-lived on purpose: there's no refresh
+    # or revocation yet (see the README), so the only thing bounding a leaked
+    # token's blast radius is how soon it expires.
+    user-token-ttl-seconds: 3600
+    # Tokens transaction-service uses to call account-service's /credit and
+    # /debit. Longer-lived since it's held by a trusted process, not carried
+    # around by a browser - fewer re-issuances to worry about.
+    service-token-ttl-seconds: 43200
+  security:
+    # Service-to-service credentials, not user accounts - deliberately kept
+    # out of the `users` table. Real deployments would pull secrets like this
+    # from a vault, not plain YAML; this is a portfolio project's version of
+    # "not hardcoded in the source that does the checking."
+    service-clients:
+      transaction-service: change-me-transaction-service-secret
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics, prometheus
+  tracing:
+    enabled: true
+    # Sample every trace while the system is small; dial this down (e.g. 0.1)
+    # before this ever resembles production traffic.
+    sampling:
+      probability: 1.0
+  zipkin:
+    tracing:
+      endpoint: http://localhost:9411/api/v2/spans
+
+logging:
+  pattern:
+    level: "%5p [${spring.application.name},%X{traceId:-},%X{spanId:-}]"

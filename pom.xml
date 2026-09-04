@@ -16,6 +16,8 @@
         <module>account-service</module>
         <module>transaction-service</module>
         <module>notification-service</module>
+        <module>auth-service</module>
+        <module>api-gateway</module>
     </modules>
 
     <properties>
@@ -44,6 +46,9 @@
              this kind of override; see the testcontainers-bom import below
              for why the property alone isn't enough. -->
         <testcontainers.version>1.21.3</testcontainers.version>
+        <!-- Release train aligned with Boot 3.3.x, for api-gateway's
+             spring-cloud-starter-gateway. -->
+        <spring-cloud.version>2023.0.3</spring-cloud.version>
     </properties>
 
     <dependencyManagement>
@@ -70,6 +75,13 @@
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-dependencies</artifactId>
                 <version>${spring-boot.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.springframework.cloud</groupId>
+                <artifactId>spring-cloud-dependencies</artifactId>
+                <version>${spring-cloud.version}</version>
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
