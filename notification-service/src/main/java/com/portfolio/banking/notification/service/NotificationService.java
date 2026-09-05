@@ -3,7 +3,9 @@ package com.portfolio.banking.notification.service;
 import com.portfolio.banking.common.event.AccountCreatedEvent;
 import com.portfolio.banking.common.event.TransferCompletedEvent;
 import com.portfolio.banking.common.event.TransferFailedEvent;
+import com.portfolio.banking.notification.client.IAccountClient;
 import com.portfolio.banking.notification.dto.NotificationResponse;
+import com.portfolio.banking.notification.exception.ForbiddenException;
 import com.portfolio.banking.notification.mapper.INotificationMapper;
 import com.portfolio.banking.notification.model.Notification;
 import com.portfolio.banking.notification.model.ProcessedEvent;
@@ -13,7 +15,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.List;
@@ -40,15 +41,18 @@ public class NotificationService implements INotificationService {
     private final INotificationRepository notificationRepository;
     private final INotificationMapper notificationMapper;
     private final TransactionTemplate transactionTemplate;
+    private final IAccountClient accountClient;
 
     public NotificationService(IProcessedEventRepository processedEventRepository,
                                 INotificationRepository notificationRepository,
                                 INotificationMapper notificationMapper,
-                                TransactionTemplate transactionTemplate) {
+                                TransactionTemplate transactionTemplate,
+                                IAccountClient accountClient) {
         this.processedEventRepository = processedEventRepository;
         this.notificationRepository = notificationRepository;
         this.notificationMapper = notificationMapper;
         this.transactionTemplate = transactionTemplate;
+        this.accountClient = accountClient;
     }
 
     @Override
@@ -68,9 +72,20 @@ public class NotificationService implements INotificationService {
         processIdempotently(event.getEventId(), () -> List.of(Notification.forTransferFailed(event)));
     }
 
+    /**
+     * Deliberately not {@code @Transactional}: {@code accountClient.getAccount}
+     * is a network call, and a database transaction must never stay open
+     * across one - see "How a transfer works" in the README for why. The
+     * repository call below runs in its own transaction regardless (Spring
+     * Data JPA wraps every repository method that way on its own), so no
+     * explicit annotation is needed here for that part to be correct.
+     */
     @Override
-    @Transactional(readOnly = true)
-    public List<NotificationResponse> listForAccount(UUID accountId) {
+    public List<NotificationResponse> listForAccount(String callerId, UUID accountId) {
+        var account = accountClient.getAccount(accountId);
+        if (!callerId.equals(account.ownerId().toString())) {
+            throw new ForbiddenException("Not authorized to view notifications for this account");
+        }
         return notificationRepository.findAllByRecipientAccountIdOrderByCreatedAtDesc(accountId).stream()
                 .map(notificationMapper::toResponse)
                 .toList();

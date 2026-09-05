@@ -36,6 +36,17 @@ spring:
         jwt:
           jwk-set-uri: http://localhost:8084/.well-known/jwks.json
 
+services:
+  account-service:
+    base-url: http://localhost:8081
+  auth-service:
+    base-url: http://localhost:8084
+    # Matches the entry auth-service's banking.security.service-clients
+    # config registers for this exact client-id - see auth-service's
+    # application.yml.
+    client-id: notification-service
+    client-secret: change-me-notification-service-secret
+
 banking:
   rabbitmq:
     exchange: banking.events

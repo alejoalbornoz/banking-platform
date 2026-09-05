@@ -24,5 +24,11 @@ public interface INotificationService {
     /** Notifies only the source account - the destination never received anything. */
     void handleTransferFailed(TransferFailedEvent event);
 
-    List<NotificationResponse> listForAccount(UUID accountId);
+    /**
+     * @param callerId the authenticated caller's subject (from their JWT) -
+     *                  must own {@code accountId}
+     * @throws com.portfolio.banking.notification.exception.ForbiddenException
+     *         if the caller doesn't own the account
+     */
+    List<NotificationResponse> listForAccount(String callerId, UUID accountId);
 }

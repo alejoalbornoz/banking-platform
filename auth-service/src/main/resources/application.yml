@@ -30,9 +30,11 @@ banking:
     # or revocation yet (see the README), so the only thing bounding a leaked
     # token's blast radius is how soon it expires.
     user-token-ttl-seconds: 3600
-    # Tokens transaction-service uses to call account-service's /credit and
-    # /debit. Longer-lived since it's held by a trusted process, not carried
-    # around by a browser - fewer re-issuances to worry about.
+    # Tokens held by trusted internal processes (transaction-service calling
+    # account-service's /credit and /debit, notification-service calling
+    # account-service's /accounts/{id} to check ownership). Longer-lived than
+    # a user token since it's not carried around by a browser - fewer
+    # re-issuances to worry about.
     service-token-ttl-seconds: 43200
   security:
     # Service-to-service credentials, not user accounts - deliberately kept
@@ -41,6 +43,7 @@ banking:
     # "not hardcoded in the source that does the checking."
     service-clients:
       transaction-service: change-me-transaction-service-secret
+      notification-service: change-me-notification-service-secret
 
 management:
   endpoints:

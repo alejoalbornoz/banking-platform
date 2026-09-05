@@ -3,7 +3,10 @@ package com.portfolio.banking.notification.service;
 import com.portfolio.banking.common.event.AccountCreatedEvent;
 import com.portfolio.banking.common.event.TransferCompletedEvent;
 import com.portfolio.banking.common.event.TransferFailedEvent;
+import com.portfolio.banking.notification.client.IAccountClient;
+import com.portfolio.banking.notification.client.dto.AccountView;
 import com.portfolio.banking.notification.dto.NotificationResponse;
+import com.portfolio.banking.notification.exception.ForbiddenException;
 import com.portfolio.banking.notification.mapper.NotificationMapper;
 import com.portfolio.banking.notification.model.Notification;
 import com.portfolio.banking.notification.model.NotificationType;
@@ -26,6 +29,7 @@ import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
@@ -42,6 +46,9 @@ class NotificationServiceTest {
     @Mock
     private INotificationRepository notificationRepository;
 
+    @Mock
+    private IAccountClient accountClient;
+
     private NotificationService notificationService;
 
     private final UUID sourceId = UUID.randomUUID();
@@ -57,14 +64,14 @@ class NotificationServiceTest {
         // for real, so the atomic mark-processed-then-notify behavior is
         // exercised exactly as in production.
         //
-        // lenient(): listForAccount is a plain @Transactional read, a no-op in
-        // a unit test with no Spring proxy, so it never touches this stub.
+        // lenient(): listForAccount doesn't use transactionTemplate at all
+        // (deliberately - see its own comment), so it never touches this stub.
         PlatformTransactionManager transactionManager = mock(PlatformTransactionManager.class);
         lenient().when(transactionManager.getTransaction(any())).thenReturn(mock(TransactionStatus.class));
         TransactionTemplate transactionTemplate = new TransactionTemplate(transactionManager);
 
         notificationService = new NotificationService(
-                processedEventRepository, notificationRepository, notificationMapper, transactionTemplate);
+                processedEventRepository, notificationRepository, notificationMapper, transactionTemplate, accountClient);
     }
 
     @SuppressWarnings("unchecked")
@@ -148,17 +155,30 @@ class NotificationServiceTest {
     }
 
     @Test
-    void listForAccount_returnsMappedNotifications() {
+    void listForAccount_callerOwnsAccount_returnsMappedNotifications() {
         UUID accountId = UUID.randomUUID();
+        UUID ownerId = UUID.randomUUID();
+        when(accountClient.getAccount(accountId)).thenReturn(new AccountView(accountId, ownerId));
         Notification notification = new Notification(
                 UUID.randomUUID(), accountId, NotificationType.ACCOUNT_CREATED, "Your account was opened.");
         when(notificationRepository.findAllByRecipientAccountIdOrderByCreatedAtDesc(accountId))
                 .thenReturn(List.of(notification));
 
-        List<NotificationResponse> responses = notificationService.listForAccount(accountId);
+        List<NotificationResponse> responses = notificationService.listForAccount(ownerId.toString(), accountId);
 
         assertThat(responses).hasSize(1);
         assertThat(responses.get(0).recipientAccountId()).isEqualTo(accountId);
         assertThat(responses.get(0).type()).isEqualTo("ACCOUNT_CREATED");
+    }
+
+    @Test
+    void listForAccount_callerDoesNotOwnAccount_throwsForbiddenAndNeverQueriesNotifications() {
+        UUID accountId = UUID.randomUUID();
+        when(accountClient.getAccount(accountId)).thenReturn(new AccountView(accountId, UUID.randomUUID()));
+        String someoneElse = UUID.randomUUID().toString();
+
+        assertThatThrownBy(() -> notificationService.listForAccount(someoneElse, accountId))
+                .isInstanceOf(ForbiddenException.class);
+        verify(notificationRepository, never()).findAllByRecipientAccountIdOrderByCreatedAtDesc(any());
     }
 }

@@ -145,8 +145,7 @@ a transfer produces one trace spanning both services.
 ### notification-service
 
 Nothing to call directly - it only listens. Create an account or run a
-transfer above, then check what it recorded (any authenticated caller can
-read any `accountId` here - see "Known gaps"):
+transfer above, then check what it recorded (403 if `accountId` isn't yours):
 
 ```bash
 curl "localhost:8080/api/v1/notifications?accountId={accountId}" -H "Authorization: Bearer {token}"
@@ -384,14 +383,19 @@ before initiating or returning a transfer - the one case where a
 service-role caller legitimately needs to read *any* account, not just its
 own.
 
-**Everywhere else, ownership is checked in the controller, not the URL
-pattern.** `GET /accounts/{id}`, `/accounts/number/{n}`, and `/ledger` all
-fetch the account first, then compare its `ownerId` to the caller's JWT
-`sub` (or accept a `ROLE_SERVICE` caller) - a route-matching rule has no way
-to know who owns a specific row before it's read. `transaction-service`
-follows the same pattern for `/transfers`: it fetches the source account's
-owner via its service token and rejects the request before the saga ever
-starts if the caller isn't it.
+**Everywhere else, ownership is checked in the controller or service layer,
+not the URL pattern.** `GET /accounts/{id}`, `/accounts/number/{n}`, and
+`/ledger` all fetch the account first, then compare its `ownerId` to the
+caller's JWT `sub` (or accept a `ROLE_SERVICE` caller) - a route-matching
+rule has no way to know who owns a specific row before it's read.
+`transaction-service` follows the same pattern for `/transfers`: it fetches
+the source account's owner via its service token and rejects the request
+before the saga ever starts if the caller isn't it. `notification-service`
+does the same for `GET /notifications?accountId=` - it has its own
+`ServiceTokenProvider` and `IAccountClient`, a near-identical copy of
+transaction-service's, since checking "does the caller own this account"
+inherently means asking account-service, and there was no way around
+duplicating that machinery a second time.
 
 **`api-gateway` is pure routing.** It doesn't validate JWTs itself - each of
 the four services behind it is already a proper resource server, so a second
@@ -469,12 +473,6 @@ parts:
   like any other failure, but "a notification exists" isn't the same as
   "someone got paged" - money genuinely stuck mid-transfer needs a real alert,
   not a row a human has to think to go query for.
-- **notification-service doesn't verify the caller owns the `accountId`
-  they're querying** - only that they're authenticated. Closing this needs
-  the same `getAccount`-plus-service-token machinery just built for
-  transaction-service, which felt like too much duplicated ceremony to add
-  to a service that didn't previously have any exception-handling
-  infrastructure of its own, for this pass.
 - **No refresh tokens or revocation.** A leaked token is valid until it
   expires (1 hour for a user token, 12 for a service token) - there's no way
   to invalidate one early short of restarting auth-service, which invalidates
