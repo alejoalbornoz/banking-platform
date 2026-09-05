@@ -5,8 +5,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.portfolio.banking.common.event.TransferCompletedEvent;
 import com.portfolio.banking.common.event.TransferFailedEvent;
 import com.portfolio.banking.transaction.client.IAccountClient;
+import com.portfolio.banking.transaction.client.dto.AccountView;
 import com.portfolio.banking.transaction.dto.TransferRequest;
 import com.portfolio.banking.transaction.dto.TransferResponse;
+import com.portfolio.banking.transaction.exception.CurrencyMismatchException;
 import com.portfolio.banking.transaction.exception.ForbiddenException;
 import com.portfolio.banking.transaction.exception.IdempotencyKeyReusedException;
 import com.portfolio.banking.transaction.exception.ResourceNotFoundException;
@@ -91,7 +93,11 @@ public class TransferService implements ITransferService {
         if (request.sourceAccountId().equals(request.destinationAccountId())) {
             throw new IllegalArgumentException("sourceAccountId and destinationAccountId must differ");
         }
-        assertCallerOwnsAccount(callerId, request.sourceAccountId());
+
+        AccountView sourceAccount = accountClient.getAccount(request.sourceAccountId());
+        assertCallerOwnsAccount(callerId, sourceAccount);
+        assertCurrencyMatches(sourceAccount, request);
+        assertCurrencyMatches(accountClient.getAccount(request.destinationAccountId()), request);
 
         Transaction transaction = findOrCreate(idempotencyKey, request);
 
@@ -123,21 +129,37 @@ public class TransferService implements ITransferService {
     }
 
     /**
-     * Fetches the account's owner via account-service (using this service's
-     * own service credential - see {@code ServiceTokenProvider}) and compares
-     * it against the caller's own JWT subject. Only the source account needs
-     * this check before a transfer starts: the destination is never expected
-     * to belong to the caller, that's the entire point of sending money to
-     * someone else.
+     * Compares an already-fetched account against the caller's own JWT
+     * subject. Only the source account needs this check before a transfer
+     * starts: the destination is never expected to belong to the caller,
+     * that's the entire point of sending money to someone else.
      */
-    private void assertCallerOwnsAccount(String callerId, UUID accountId) {
-        if (!ownsAccount(callerId, accountId)) {
-            throw new ForbiddenException("Not authorized to transfer from account " + accountId);
+    private void assertCallerOwnsAccount(String callerId, AccountView sourceAccount) {
+        if (!ownsAccount(callerId, sourceAccount)) {
+            throw new ForbiddenException("Not authorized to transfer from account " + sourceAccount.id());
+        }
+    }
+
+    /**
+     * Neither account can change currency after creation, so this is a
+     * structural property of the request, not a business outcome that could
+     * differ on retry - checked before {@code findOrCreate}, alongside the
+     * self-transfer check, so a mismatch never creates a transaction row at
+     * all. This project doesn't do FX conversion; see the README.
+     */
+    private void assertCurrencyMatches(AccountView account, TransferRequest request) {
+        if (!account.currency().equals(request.currency())) {
+            throw new CurrencyMismatchException("Transfer currency " + request.currency()
+                    + " does not match account " + account.id() + "'s currency " + account.currency());
         }
     }
 
     private boolean ownsAccount(String callerId, UUID accountId) {
-        return callerId.equals(accountClient.getAccount(accountId).ownerId().toString());
+        return ownsAccount(callerId, accountClient.getAccount(accountId));
+    }
+
+    private boolean ownsAccount(String callerId, AccountView account) {
+        return callerId.equals(account.ownerId().toString());
     }
 
     private Transaction findOrCreate(String idempotencyKey, TransferRequest request) {

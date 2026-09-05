@@ -124,7 +124,9 @@ class TransferSagaIT {
     @BeforeEach
     void setUpCaller() {
         callerToken = mintToken(ownerId.toString(), "USER");
-        lenient().when(accountClient.getAccount(sourceId)).thenReturn(new AccountView(sourceId, ownerId));
+        lenient().when(accountClient.getAccount(sourceId)).thenReturn(new AccountView(sourceId, ownerId, "USD"));
+        lenient().when(accountClient.getAccount(destinationId))
+                .thenReturn(new AccountView(destinationId, UUID.randomUUID(), "USD"));
     }
 
     /**

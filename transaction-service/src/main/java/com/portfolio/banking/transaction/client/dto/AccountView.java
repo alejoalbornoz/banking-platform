@@ -8,5 +8,5 @@ import java.util.UUID;
  * status, and more - deserializing into this narrower shape simply ignores
  * whatever else is in the JSON.
  */
-public record AccountView(UUID id, UUID ownerId) {
+public record AccountView(UUID id, UUID ownerId, String currency) {
 }

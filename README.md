@@ -226,7 +226,18 @@ crash recomputes the identical key.
 A transfer has to debit one account and credit another, in a different
 service, over HTTP. There is no distributed transaction to lean on, so it's
 run as a **saga with one compensating action**, tracked by a row whose status
-is the saga's state machine:
+is the saga's state machine.
+
+Before any of that starts, `TransferService` fetches both accounts (via
+account-service, using its own service credential) and checks two things:
+that the caller owns the source account (see "Authentication"), and that
+**both accounts' currency matches the transfer's requested currency** - a USD
+transfer can't touch a EUR account, and this project doesn't do FX
+conversion. Neither check depends on anything that changes over time (an
+account's owner and currency are both fixed at creation), so a mismatch is
+rejected with `400 CURRENCY_MISMATCH` before a transaction row is ever
+created - unlike insufficient funds, which is a saga *outcome* since the
+balance it depends on can genuinely change between attempts.
 
 ```
 PENDING ──debit ok──> DEBITED ──credit ok──> COMPLETED
@@ -463,11 +474,6 @@ Docker Desktop, no proxy layer) is unaffected.
 Being explicit about what is *not* solved yet, since these are the interesting
 parts:
 
-- **Currency isn't validated across a transfer.** A transfer carries a
-  currency, but nothing checks it against the two accounts' currencies, so a
-  USD transfer between EUR accounts would go through. Doing this properly
-  means deciding what multi-currency even means here (reject the mismatch, or
-  introduce FX), which is its own piece of work.
 - **A `COMPENSATION_FAILED` transfer still just sits in the database.**
   notification-service now records a `TRANSFER_FAILED` notification for it
   like any other failure, but "a notification exists" isn't the same as

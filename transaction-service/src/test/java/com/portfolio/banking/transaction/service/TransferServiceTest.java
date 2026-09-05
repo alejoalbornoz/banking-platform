@@ -7,6 +7,7 @@ import com.portfolio.banking.transaction.client.IAccountClient;
 import com.portfolio.banking.transaction.client.dto.AccountView;
 import com.portfolio.banking.transaction.dto.TransferRequest;
 import com.portfolio.banking.transaction.dto.TransferResponse;
+import com.portfolio.banking.transaction.exception.CurrencyMismatchException;
 import com.portfolio.banking.transaction.exception.ForbiddenException;
 import com.portfolio.banking.transaction.exception.IdempotencyKeyReusedException;
 import com.portfolio.banking.transaction.exception.InsufficientFundsException;
@@ -96,10 +97,13 @@ class TransferServiceTest {
 
         lenient().when(transactionRepository.save(any(Transaction.class))).thenAnswer(inv -> inv.getArgument(0));
 
-        // Every transfer() call checks the caller owns the source account
-        // before doing anything else - lenient() since the self-transfer
-        // test rejects the request before this is ever consulted.
-        lenient().when(accountClient.getAccount(sourceId)).thenReturn(new AccountView(sourceId, ownerId));
+        // Every transfer() call checks the caller owns the source account and
+        // that both accounts' currencies match the request before doing
+        // anything else - lenient() since the self-transfer test rejects the
+        // request before either of these is ever consulted.
+        lenient().when(accountClient.getAccount(sourceId)).thenReturn(new AccountView(sourceId, ownerId, "USD"));
+        lenient().when(accountClient.getAccount(destinationId))
+                .thenReturn(new AccountView(destinationId, UUID.randomUUID(), "USD"));
 
         transferService = new TransferService(
                 transactionRepository, outboxEventRepository, transactionMapper,
@@ -307,10 +311,30 @@ class TransferServiceTest {
         completed.markCompleted();
         when(transactionRepository.findById(transactionId)).thenReturn(Optional.of(completed));
         when(accountClient.getAccount(destinationId))
-                .thenReturn(new AccountView(destinationId, UUID.randomUUID()));
+                .thenReturn(new AccountView(destinationId, UUID.randomUUID(), "USD"));
 
         String someoneElse = UUID.randomUUID().toString();
         assertThatThrownBy(() -> transferService.getTransaction(someoneElse, transactionId))
                 .isInstanceOf(ForbiddenException.class);
+    }
+
+    @Test
+    void transfer_sourceCurrencyDoesNotMatchRequest_throwsCurrencyMismatchBeforeCreatingTransaction() {
+        when(accountClient.getAccount(sourceId)).thenReturn(new AccountView(sourceId, ownerId, "EUR"));
+
+        assertThatThrownBy(() -> transferService.transfer(callerId, "key-14", request))
+                .isInstanceOf(CurrencyMismatchException.class);
+        verify(transactionRepository, never()).save(any());
+        verify(accountClient, never()).debit(any(), any(), any());
+    }
+
+    @Test
+    void transfer_destinationCurrencyDoesNotMatchRequest_throwsCurrencyMismatchBeforeCreatingTransaction() {
+        when(accountClient.getAccount(destinationId)).thenReturn(new AccountView(destinationId, UUID.randomUUID(), "EUR"));
+
+        assertThatThrownBy(() -> transferService.transfer(callerId, "key-15", request))
+                .isInstanceOf(CurrencyMismatchException.class);
+        verify(transactionRepository, never()).save(any());
+        verify(accountClient, never()).debit(any(), any(), any());
     }
 }

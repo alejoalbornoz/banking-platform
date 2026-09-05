@@ -34,6 +34,11 @@ public class GlobalExceptionHandler {
         return build(HttpStatus.FORBIDDEN, ex.getErrorCode(), ex.getMessage(), request, List.of());
     }
 
+    @ExceptionHandler(CurrencyMismatchException.class)
+    public ResponseEntity<ErrorResponse> handleCurrencyMismatch(CurrencyMismatchException ex, HttpServletRequest request) {
+        return build(HttpStatus.BAD_REQUEST, ex.getErrorCode(), ex.getMessage(), request, List.of());
+    }
+
     @ExceptionHandler(MissingRequestHeaderException.class)
     public ResponseEntity<ErrorResponse> handleMissingHeader(MissingRequestHeaderException ex, HttpServletRequest request) {
         return build(HttpStatus.BAD_REQUEST, "MISSING_HEADER", ex.getMessage(), request, List.of());
