@@ -3,6 +3,7 @@ package com.portfolio.banking.transaction.service;
 import com.portfolio.banking.transaction.dto.TransferRequest;
 import com.portfolio.banking.transaction.dto.TransferResponse;
 
+import java.util.List;
 import java.util.UUID;
 
 public interface ITransferService {
@@ -28,4 +29,17 @@ public interface ITransferService {
      *         if the caller owns neither the source nor the destination account
      */
     TransferResponse getTransaction(String callerId, UUID transactionId);
+
+    /**
+     * Every transfer currently stuck in {@code COMPENSATION_FAILED} - money
+     * that left an account and reached nobody. This is what the stuck-transfer
+     * alert points an operator at, and the answer to "is anything stuck right
+     * now", which a log line can't give.
+     * <p>
+     * Takes no caller: unlike everything else here, it deliberately spans all
+     * users rather than being scoped to one, which is exactly why it's
+     * restricted to {@code ROLE_SERVICE} in {@code SecurityConfig} instead of
+     * being authorized by ownership.
+     */
+    List<TransferResponse> listStuckTransfers();
 }

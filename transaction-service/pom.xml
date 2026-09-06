@@ -53,6 +53,16 @@
             <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
         </dependency>
 
+        <!-- Backs the /actuator/prometheus endpoint this service's
+             application.yml already exposes. Without it that exposure is dead
+             config, and the stuck-transfer counter (see StuckTransferAlerter)
+             would have no scrape endpoint for an alert rule to point at. -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
         <!-- Tracing -->
         <dependency>
             <groupId>io.micrometer</groupId>

@@ -274,6 +274,38 @@ between - holding a DB connection (and possibly row locks) open for the
 duration of another service's call, retries included, is how connection pools
 die.
 
+### When the compensation itself fails
+
+Every other outcome above is *handled*: the money either moved or it didn't,
+and the status says which. `COMPENSATION_FAILED` is the one that isn't - the
+debit committed, the credit failed, and crediting the source back failed too,
+so money has left an account and reached nobody. No retry fixes that; a human
+has to.
+
+So that's the one path that raises an alert rather than only recording an
+outcome. `StuckTransferAlerter` increments a Micrometer counter
+(`banking.transfers.stuck`, exposed at `/actuator/metrics/banking.transfers.stuck`
+and `/actuator/prometheus`) and writes an ERROR log line carrying both
+failure reasons under an `OPS_ALERT` marker. The counter is what actually
+pages someone: its correct value is permanently zero, so the alert rule is
+"any increase at all", and the metric is deliberately **untagged** - tagging
+by transaction id would give a monitoring backend one new time series per
+incident, which is how cardinality explosions happen. Identifiers live in the
+log line and in `GET /api/v1/transfers/stuck`, which lists everything
+currently stuck (`ROLE_SERVICE`-only, since it spans every user's transfers)
+and answers the question a log line can't: *is anything stuck right now.*
+
+Two ordering details matter. The alert fires **before** the
+`COMPENSATION_FAILED` row is written, because the money is already stuck by
+that point regardless of whether the write succeeds - alerting afterwards
+would make the worst case (stuck money *and* no record of it) the silent one.
+And a failure in the alerting channel is caught and logged rather than
+propagated, so an unreachable pager can never cost us the database record.
+That matters because `IStuckTransferAlerter` exists precisely as a seam:
+swapping the log-and-metric implementation for a real pager, a Slack webhook,
+or an incident API is implementing one method, and that implementation would
+make network calls.
+
 ## Reliable events: the outbox pattern (transaction-service)
 
 Committing to the database and publishing to RabbitMQ are two separate
@@ -474,11 +506,16 @@ Docker Desktop, no proxy layer) is unaffected.
 Being explicit about what is *not* solved yet, since these are the interesting
 parts:
 
-- **A `COMPENSATION_FAILED` transfer still just sits in the database.**
-  notification-service now records a `TRANSFER_FAILED` notification for it
-  like any other failure, but "a notification exists" isn't the same as
-  "someone got paged" - money genuinely stuck mid-transfer needs a real alert,
-  not a row a human has to think to go query for.
+- **Nothing consumes the stuck-transfer alert yet.** The counter and the
+  marked log line are emitted (see "When the compensation itself fails"), but
+  wiring them to something that actually wakes a person - a Prometheus alert
+  rule, a log-based monitor, a pager - is deployment configuration this repo
+  doesn't contain. The seam is `IStuckTransferAlerter`; only the last mile is
+  missing.
+- **The other three services expose `/actuator/prometheus` in config but
+  don't ship the registry that serves it.** Only transaction-service has
+  `micrometer-registry-prometheus`, added because that's where the alert
+  metric lives. The others' exposure line is currently dead config.
 - **No refresh tokens or revocation.** A leaked token is valid until it
   expires (1 hour for a user token, 12 for a service token) - there's no way
   to invalidate one early short of restarting auth-service, which invalidates

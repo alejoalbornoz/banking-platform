@@ -16,6 +16,7 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.List;
 import java.util.UUID;
 
 @RestController
@@ -39,6 +40,20 @@ public class TransactionController {
     @GetMapping("/{transactionId}")
     public TransferResponse getTransaction(@AuthenticationPrincipal Jwt caller, @PathVariable UUID transactionId) {
         return transferService.getTransaction(caller.getSubject(), transactionId);
+    }
+
+    /**
+     * The ops view behind the stuck-transfer alert: every transfer currently
+     * in COMPENSATION_FAILED, across all users. Restricted to
+     * {@code ROLE_SERVICE} in {@code SecurityConfig} - it's the one endpoint
+     * here that isn't scoped to the caller's own accounts.
+     * <p>
+     * The literal {@code /stuck} segment takes precedence over the
+     * {@code /{transactionId}} mapping above, so the two don't collide.
+     */
+    @GetMapping("/stuck")
+    public List<TransferResponse> listStuckTransfers() {
+        return transferService.listStuckTransfers();
     }
 
     /** 201 when this call is the one that completed the transfer; 200 for anything else (failed, or a replayed result). */

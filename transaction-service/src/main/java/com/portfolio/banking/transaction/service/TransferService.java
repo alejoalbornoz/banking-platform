@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.portfolio.banking.common.event.TransferCompletedEvent;
 import com.portfolio.banking.common.event.TransferFailedEvent;
+import com.portfolio.banking.transaction.alert.IStuckTransferAlerter;
 import com.portfolio.banking.transaction.client.IAccountClient;
 import com.portfolio.banking.transaction.client.dto.AccountView;
 import com.portfolio.banking.transaction.dto.TransferRequest;
@@ -15,6 +16,7 @@ import com.portfolio.banking.transaction.exception.ResourceNotFoundException;
 import com.portfolio.banking.transaction.mapper.ITransactionMapper;
 import com.portfolio.banking.transaction.model.OutboxEvent;
 import com.portfolio.banking.transaction.model.Transaction;
+import com.portfolio.banking.transaction.model.TransactionStatus;
 import com.portfolio.banking.transaction.repository.IOutboxEventRepository;
 import com.portfolio.banking.transaction.repository.ITransactionRepository;
 import org.slf4j.Logger;
@@ -27,6 +29,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
+import java.util.List;
 import java.util.UUID;
 
 /**
@@ -71,6 +74,7 @@ public class TransferService implements ITransferService {
     private final RetryTemplate remoteCallRetryTemplate;
     private final TransactionTemplate transactionTemplate;
     private final ObjectMapper objectMapper;
+    private final IStuckTransferAlerter stuckTransferAlerter;
 
     public TransferService(ITransactionRepository transactionRepository,
                             IOutboxEventRepository outboxEventRepository,
@@ -78,7 +82,8 @@ public class TransferService implements ITransferService {
                             IAccountClient accountClient,
                             RetryTemplate remoteCallRetryTemplate,
                             TransactionTemplate transactionTemplate,
-                            ObjectMapper objectMapper) {
+                            ObjectMapper objectMapper,
+                            IStuckTransferAlerter stuckTransferAlerter) {
         this.transactionRepository = transactionRepository;
         this.outboxEventRepository = outboxEventRepository;
         this.transactionMapper = transactionMapper;
@@ -86,6 +91,7 @@ public class TransferService implements ITransferService {
         this.remoteCallRetryTemplate = remoteCallRetryTemplate;
         this.transactionTemplate = transactionTemplate;
         this.objectMapper = objectMapper;
+        this.stuckTransferAlerter = stuckTransferAlerter;
     }
 
     @Override
@@ -126,6 +132,14 @@ public class TransferService implements ITransferService {
             throw new ForbiddenException("Not authorized to view this transfer");
         }
         return transactionMapper.toResponse(transaction);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<TransferResponse> listStuckTransfers() {
+        return transactionRepository.findAllByStatus(TransactionStatus.COMPENSATION_FAILED).stream()
+                .map(transactionMapper::toResponse)
+                .toList();
     }
 
     /**
@@ -264,11 +278,9 @@ public class TransferService implements ITransferService {
             creditWithRetry(transaction.getSourceAccountId(),
                     operationKeyFor(transaction, LEG_COMPENSATION), transaction.getAmount());
         } catch (RuntimeException compensationFailure) {
-            // The worst case: money is stuck mid-transfer. In a real system
-            // this should page someone, not just sit in COMPENSATION_FAILED.
-            log.error("Transfer {} compensation FAILED - manual intervention required. "
-                            + "Credit failure: {}. Compensation failure: {}",
-                    transaction.getId(), creditFailure.getMessage(), compensationFailure.getMessage());
+            // The worst case: money is stuck mid-transfer, so this is the one
+            // path that pages a human rather than just recording an outcome.
+            raiseStuckTransferAlert(transaction, creditFailure, compensationFailure);
             String reason = "Credit to destination failed (" + creditFailure.getMessage()
                     + ") and compensation also failed (" + compensationFailure.getMessage()
                     + "); manual intervention required";
@@ -279,6 +291,33 @@ public class TransferService implements ITransferService {
         Transaction failed = markFailedWithOutbox(transaction,
                 "Credit to destination failed and was compensated: " + creditFailure.getMessage());
         return transactionMapper.toResponse(failed);
+    }
+
+    /**
+     * Alerts <em>before</em> persisting COMPENSATION_FAILED, and never lets a
+     * failure here stop that persistence. Both halves of that matter:
+     * <ul>
+     *   <li>The money is already stuck by this point - that's a fact about
+     *       account-service's state, not about our row. If the write below
+     *       then fails too, an alert that already fired is exactly what we
+     *       want; alerting afterwards would mean the worst case (stuck money
+     *       <em>and</em> no record of it) is also the silent one.</li>
+     *   <li>Conversely, an alerting channel that's down must not cost us the
+     *       record. {@link IStuckTransferAlerter} is explicitly a seam for
+     *       implementations that make network calls, so this swallows and
+     *       logs whatever it throws rather than letting it propagate into
+     *       the catch block that persists the state.</li>
+     * </ul>
+     */
+    private void raiseStuckTransferAlert(Transaction transaction, RuntimeException creditFailure,
+                                          RuntimeException compensationFailure) {
+        try {
+            stuckTransferAlerter.alert(transaction, creditFailure.getMessage(), compensationFailure.getMessage());
+        } catch (RuntimeException alertingFailure) {
+            log.error("Failed to raise the stuck-transfer alert for transaction {} - the transfer is still stuck "
+                            + "and is being recorded as COMPENSATION_FAILED regardless",
+                    transaction.getId(), alertingFailure);
+        }
     }
 
     /**

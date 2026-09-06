@@ -3,6 +3,7 @@ package com.portfolio.banking.transaction.service;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import com.portfolio.banking.transaction.alert.IStuckTransferAlerter;
 import com.portfolio.banking.transaction.client.IAccountClient;
 import com.portfolio.banking.transaction.client.dto.AccountView;
 import com.portfolio.banking.transaction.dto.TransferRequest;
@@ -31,6 +32,7 @@ import org.springframework.transaction.TransactionStatus;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -59,6 +61,9 @@ class TransferServiceTest {
 
     @Mock
     private IAccountClient accountClient;
+
+    @Mock
+    private IStuckTransferAlerter stuckTransferAlerter;
 
     private TransferService transferService;
 
@@ -107,7 +112,7 @@ class TransferServiceTest {
 
         transferService = new TransferService(
                 transactionRepository, outboxEventRepository, transactionMapper,
-                accountClient, retryTemplate, transactionTemplate, objectMapper);
+                accountClient, retryTemplate, transactionTemplate, objectMapper, stuckTransferAlerter);
     }
 
     @Test
@@ -174,6 +179,11 @@ class TransferServiceTest {
         ArgumentCaptor<OutboxEvent> outboxCaptor = ArgumentCaptor.forClass(OutboxEvent.class);
         verify(outboxEventRepository).save(outboxCaptor.capture());
         assertThat(outboxCaptor.getValue().getEventType()).isEqualTo("transfer.failed");
+
+        // The compensation worked, so no money is stuck and nobody should be
+        // woken up. An alert that fires on ordinary handled failures is an
+        // alert people learn to ignore.
+        verify(stuckTransferAlerter, never()).alert(any(), any(), any());
     }
 
     @Test
@@ -189,6 +199,32 @@ class TransferServiceTest {
 
         assertThat(response.status()).isEqualTo("COMPENSATION_FAILED");
         assertThat(response.failureReason()).contains("manual intervention required");
+
+        ArgumentCaptor<Transaction> alerted = ArgumentCaptor.forClass(Transaction.class);
+        verify(stuckTransferAlerter).alert(alerted.capture(),
+                eq("destination account not found"), eq("source account vanished too"));
+        assertThat(alerted.getValue().getSourceAccountId()).isEqualTo(sourceId);
+        assertThat(alerted.getValue().getAmount()).isEqualByComparingTo(amount);
+    }
+
+    @Test
+    void transfer_alertingFailure_stillRecordsCompensationFailed() {
+        // The alerting channel is a seam for implementations that make network
+        // calls, so it can fail. Losing the record of stuck money because the
+        // pager was down would turn one problem into a worse, invisible one.
+        when(transactionRepository.findByIdempotencyKey("key-16")).thenReturn(Optional.empty());
+        doNothing().when(accountClient).debit(eq(sourceId), anyString(), eq(amount));
+        doThrow(new ResourceNotFoundException("destination account not found"))
+                .when(accountClient).credit(eq(destinationId), anyString(), eq(amount));
+        doThrow(new ResourceNotFoundException("source account vanished too"))
+                .when(accountClient).credit(eq(sourceId), anyString(), eq(amount));
+        doThrow(new IllegalStateException("pager unreachable"))
+                .when(stuckTransferAlerter).alert(any(), any(), any());
+
+        TransferResponse response = transferService.transfer(callerId, "key-16", request);
+
+        assertThat(response.status()).isEqualTo("COMPENSATION_FAILED");
+        verify(outboxEventRepository).save(any(OutboxEvent.class));
     }
 
     @Test
@@ -316,6 +352,24 @@ class TransferServiceTest {
         String someoneElse = UUID.randomUUID().toString();
         assertThatThrownBy(() -> transferService.getTransaction(someoneElse, transactionId))
                 .isInstanceOf(ForbiddenException.class);
+    }
+
+    @Test
+    void listStuckTransfers_returnsOnlyCompensationFailedOnes() {
+        Transaction stuck = new Transaction("key-17", sourceId, destinationId, amount, "USD");
+        stuck.markDebited();
+        stuck.markCompensationFailed("credit failed and compensation also failed");
+        // Spelled out because Spring's own TransactionStatus is already
+        // imported here, for the TransactionTemplate setup above.
+        when(transactionRepository.findAllByStatus(
+                com.portfolio.banking.transaction.model.TransactionStatus.COMPENSATION_FAILED))
+                .thenReturn(List.of(stuck));
+
+        List<TransferResponse> stuckTransfers = transferService.listStuckTransfers();
+
+        assertThat(stuckTransfers).hasSize(1);
+        assertThat(stuckTransfers.get(0).status()).isEqualTo("COMPENSATION_FAILED");
+        assertThat(stuckTransfers.get(0).sourceAccountId()).isEqualTo(sourceId);
     }
 
     @Test
