@@ -6,7 +6,7 @@ spring:
     name: account-service
 
   datasource:
-    url: jdbc:postgresql://localhost:5432/account_db
+    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:5432/account_db
     username: banking
     password: banking
     driver-class-name: org.postgresql.Driver
@@ -25,7 +25,7 @@ spring:
     locations: classpath:db/migration
 
   rabbitmq:
-    host: localhost
+    host: ${RABBITMQ_HOST:localhost}
     port: 5672
     username: banking
     password: banking
@@ -37,7 +37,7 @@ spring:
           # No secret configured here at all - Spring Security fetches and
           # caches auth-service's public key set from this endpoint and
           # validates every token's signature against it.
-          jwk-set-uri: http://localhost:8084/.well-known/jwks.json
+          jwk-set-uri: http://${AUTH_SERVICE_HOST:localhost}:8084/.well-known/jwks.json
 
 banking:
   rabbitmq:
@@ -56,7 +56,7 @@ management:
       probability: 1.0
   zipkin:
     tracing:
-      endpoint: http://localhost:9411/api/v2/spans
+      endpoint: http://${ZIPKIN_HOST:localhost}:9411/api/v2/spans
 
 logging:
   pattern:

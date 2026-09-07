@@ -97,10 +97,27 @@
     <build>
         <pluginManagement>
             <plugins>
+                <!-- The repackage execution has to be declared by hand.
+                     spring-boot-starter-parent binds it to the package phase
+                     for you; we import the BOM instead of inheriting that
+                     parent (same reason maven.compiler.parameters is set
+                     explicitly above), so without this the plugin is present
+                     but never runs, and every module produces a plain jar
+                     with no Main-Class. That goes unnoticed for as long as
+                     everything is started with `spring-boot:run` - it only
+                     surfaces the first time someone runs `java -jar`, which
+                     is exactly what the Docker images do. -->
                 <plugin>
                     <groupId>org.springframework.boot</groupId>
                     <artifactId>spring-boot-maven-plugin</artifactId>
                     <version>${spring-boot.version}</version>
+                    <executions>
+                        <execution>
+                            <goals>
+                                <goal>repackage</goal>
+                            </goals>
+                        </execution>
+                    </executions>
                 </plugin>
                 <!-- Version only, no executions here on purpose: the plugin
                      lifecycle runs verify BEFORE install, so binding these

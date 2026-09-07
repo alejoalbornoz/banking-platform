@@ -34,41 +34,55 @@ design.
 | `auth-service` | 8084 | ✅ built | User registration/login, JWT issuance, JWKS publishing |
 | `api-gateway` | 8080 | ✅ built | Single entry point, path-based routing |
 
-## Running locally
+## Running the whole thing
 
-1. Start infrastructure:
-   ```bash
-   docker compose up -d
-   ```
-   This brings up:
-   - Postgres on `5432` (databases `account_db`, `transaction_db`, `notification_db`, `auth_db` are pre-created)
-   - RabbitMQ on `5672` (management UI at http://localhost:15672, user/pass `banking`/`banking`)
-   - Zipkin on `9411` (UI at http://localhost:9411)
+```bash
+docker compose up --build --wait
+```
 
-2. Build everything:
-   ```bash
-   mvn clean install
-   ```
+That builds all five services and starts them alongside Postgres, RabbitMQ,
+and Zipkin. `--wait` returns once every container reports healthy, so when
+the command finishes the platform is actually ready to take requests - go
+straight to "Trying the API" below, on port 8080.
 
-3. Run the services (each in its own terminal). All of them run their Flyway
-   migrations automatically on startup. Start `auth-service` first - the
-   other three fetch its public key set on first use, and `api-gateway` just
-   routes to whichever of the four are up:
-   ```bash
-   mvn -pl auth-service spring-boot:run
-   ```
-   ```bash
-   mvn -pl account-service spring-boot:run
-   ```
-   ```bash
-   mvn -pl transaction-service spring-boot:run
-   ```
-   ```bash
-   mvn -pl notification-service spring-boot:run
-   ```
-   ```bash
-   mvn -pl api-gateway spring-boot:run
-   ```
+- API gateway on `8080` - the only port a client needs
+- Postgres on `5432` (databases `account_db`, `transaction_db`,
+  `notification_db`, `auth_db` are pre-created)
+- RabbitMQ on `5672` (management UI at http://localhost:15672, `banking`/`banking`)
+- Zipkin on `9411` (UI at http://localhost:9411)
+
+The services are also published individually on `8081`-`8084`, which is
+useful for looking at one service's `/actuator` directly, though normal
+traffic has no reason to bypass the gateway.
+
+All five build from the same root `Dockerfile`, selected by a `MODULE` build
+arg. The build stage is identical for each, so Docker runs the Maven build
+once and the other four reuse that layer instead of compiling the same
+reactor five times.
+
+## Running a single service from source
+
+For working on one service, running it from Maven against the containerised
+infrastructure is faster than rebuilding an image each time:
+
+```bash
+docker compose up -d postgres rabbitmq zipkin
+```
+```bash
+mvn clean install
+```
+```bash
+mvn -pl account-service spring-boot:run
+```
+
+Every host in the config defaults to `localhost` (`${POSTGRES_HOST:localhost}`
+and friends), and Compose overrides those with service names when the
+services run as containers - so the same `application.yml` works both ways
+with nothing to switch. A service started from Maven talks to the
+containerised ones over the published ports without any extra setup.
+
+Start `auth-service` first if you're running several by hand: the others
+fetch its public key set the first time they validate a token.
 
 ## Trying the API
 

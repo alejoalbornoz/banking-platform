@@ -1,0 +1,10 @@
+# Everything here would otherwise be shipped into the build context on every
+# build - target/ alone is hundreds of megabytes of compiled output that the
+# image rebuilds from source anyway.
+target/
+*/target/
+.git/
+.github/
+.idea/
+*.iml
+.claude/

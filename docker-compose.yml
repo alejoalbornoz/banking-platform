@@ -42,5 +42,128 @@ services:
     ports:
       - "9411:9411" # UI: http://localhost:9411
 
+  # The five services below all build from the same root Dockerfile, picking
+  # their jar with the MODULE arg - see that file for why one shared build
+  # stage is cheaper than five.
+  #
+  # Each service's application.yml defaults every host to localhost, so
+  # running them straight from Maven still works untouched; the variables
+  # here are only what changes when they're on Compose's network and have to
+  # find each other by service name instead.
+  auth-service:
+    build:
+      context: .
+      args:
+        MODULE: auth-service
+    container_name: banking-auth-service
+    environment: &infra-hosts
+      POSTGRES_HOST: postgres
+      RABBITMQ_HOST: rabbitmq
+      ZIPKIN_HOST: zipkin
+      AUTH_SERVICE_HOST: auth-service
+      ACCOUNT_SERVICE_HOST: account-service
+      TRANSACTION_SERVICE_HOST: transaction-service
+      NOTIFICATION_SERVICE_HOST: notification-service
+    ports:
+      - "8084:8084"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # Busybox wget, which the alpine JRE base image has; it has no curl.
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8084/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  account-service:
+    build:
+      context: .
+      args:
+        MODULE: account-service
+    container_name: banking-account-service
+    environment: *infra-hosts
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8081/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  transaction-service:
+    build:
+      context: .
+      args:
+        MODULE: transaction-service
+    container_name: banking-transaction-service
+    environment: *infra-hosts
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8082/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  notification-service:
+    build:
+      context: .
+      args:
+        MODULE: notification-service
+    container_name: banking-notification-service
+    environment: *infra-hosts
+    ports:
+      - "8083:8083"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8083/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  api-gateway:
+    build:
+      context: .
+      args:
+        MODULE: api-gateway
+    container_name: banking-api-gateway
+    environment: *infra-hosts
+    ports:
+      - "8080:8080"
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      account-service:
+        condition: service_healthy
+      transaction-service:
+        condition: service_healthy
+      notification-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
 volumes:
   postgres-data:

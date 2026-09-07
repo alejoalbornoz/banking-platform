@@ -6,7 +6,7 @@ spring:
     name: auth-service
 
   datasource:
-    url: jdbc:postgresql://localhost:5432/auth_db
+    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:5432/auth_db
     username: banking
     password: banking
     driver-class-name: org.postgresql.Driver
@@ -58,7 +58,7 @@ management:
       probability: 1.0
   zipkin:
     tracing:
-      endpoint: http://localhost:9411/api/v2/spans
+      endpoint: http://${ZIPKIN_HOST:localhost}:9411/api/v2/spans
 
 logging:
   pattern:
