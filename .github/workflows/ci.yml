@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch makes the in-flight run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build, unit tests, integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      # One command covers both layers: surefire runs the unit tests first,
+      # and only if they pass does failsafe start containers for the *IT
+      # classes. See "Integration tests" in the README for why those are
+      # behind a profile rather than bound unconditionally.
+      #
+      # This is also the only place the integration tests actually run. They
+      # need a Docker daemon, and the project's own dev machine can't give
+      # them one that Testcontainers can talk to (a Docker Desktop proxy
+      # incompatibility documented in the README). An ubuntu runner has a
+      # native /var/run/docker.sock with none of that in the way, so
+      # Testcontainers starts Postgres and RabbitMQ here with no extra setup -
+      # no `services:` block needed, since the tests bring their own.
+      #
+      # --fail-at-end: the services don't depend on each other, so a failure
+      # in one module's tests shouldn't hide the state of the next four. With
+      # the default fail-fast, a broken account-service test means the run
+      # never reaches transaction-service at all, and you learn about its
+      # failures one push at a time. The build still fails either way.
+      - name: Build and test
+        run: mvn -B --no-transfer-progress --fail-at-end verify -Pintegration-tests
+
+      # Surefire/failsafe write the actual assertion failures and stack traces
+      # here; the console output alone usually isn't enough to diagnose a
+      # failure you can't reproduce locally.
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            **/target/surefire-reports/
+            **/target/failsafe-reports/
+          retention-days: 7

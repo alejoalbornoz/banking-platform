@@ -1,5 +1,7 @@
 # Banking platform (portfolio project)
 
+[![CI](https://github.com/alejoalbornoz/banking-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/alejoalbornoz/banking-platform/actions/workflows/ci.yml)
+
 A backend banking system built as a set of independent services (SOA),
 demonstrating real-world challenges in that domain: optimistic-locking
 concurrency control, idempotent operations, event-driven communication over
@@ -498,8 +500,33 @@ old) bundled docker-java client; bumping `<testcontainers.version>` in the
 root `pom.xml` didn't resolve it either. Running Maven from *inside* WSL2,
 talking to the Linux-native Docker socket directly instead of through Docker
 Desktop's Windows-side proxy, should sidestep this entirely, but that needs
-its own JDK/Maven install inside the distro and hasn't been tried. CI (no
-Docker Desktop, no proxy layer) is unaffected.
+its own JDK/Maven install inside the distro and hasn't been tried.
+
+**So CI is where these actually run.** An ubuntu runner has a native
+`/var/run/docker.sock` with none of Docker Desktop's proxy layer in the way,
+so Testcontainers works there with no configuration at all - which is why the
+workflow below runs the profile that this machine can't.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push to `main` and every pull
+request:
+
+```bash
+mvn -B --no-transfer-progress --fail-at-end verify -Pintegration-tests
+```
+
+One command covers both layers - surefire runs the unit tests, and only if
+they pass does failsafe start the Testcontainers-backed `*IT` classes. The
+workflow needs no `services:` block for Postgres or RabbitMQ: the tests bring
+their own containers up themselves.
+
+`--fail-at-end` is deliberate: the services don't depend on one another, so
+the default fail-fast would stop at the first broken module and leave the
+state of the remaining four unknown until the next push. On a failed run the
+surefire and failsafe reports are uploaded as an artifact, since the console
+output alone usually isn't enough to diagnose a failure you can't reproduce
+locally.
 
 ## Known gaps
 
