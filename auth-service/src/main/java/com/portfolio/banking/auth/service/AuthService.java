@@ -11,6 +11,7 @@ import com.portfolio.banking.auth.exception.InvalidCredentialsException;
 import com.portfolio.banking.auth.model.User;
 import com.portfolio.banking.auth.repository.IUserRepository;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.oauth2.jose.jws.SignatureAlgorithm;
 import org.springframework.security.oauth2.jwt.JwsHeader;
@@ -52,6 +53,16 @@ public class AuthService implements IAuthService {
         this.serviceTokenTtlSeconds = serviceTokenTtlSeconds;
     }
 
+    /**
+     * The lookup handles the ordinary case; the {@code unique (email)}
+     * constraint handles the case the lookup structurally can't. Two
+     * simultaneous registrations of the same address both see "not taken",
+     * both insert, and only the database can arbitrate that - the same
+     * division of labour as account-service's ledger. Without the catch, the
+     * loser of that race gets a raw constraint violation surfaced as a 500,
+     * when what actually happened is precisely the 409 this already reports
+     * in the common case.
+     */
     @Override
     @Transactional
     public UserResponse register(RegisterRequest request) {
@@ -60,12 +71,18 @@ public class AuthService implements IAuthService {
             throw new EmailAlreadyExistsException(email);
         }
         User user = new User(email, passwordEncoder.encode(request.password()));
-        // saveAndFlush, not save: @CreationTimestamp is populated by
-        // Hibernate when the INSERT is actually written, which a plain
-        // save() defers to commit - without the flush, createdAt would come
-        // back null here even though it's NOT NULL in the database.
-        User saved = userRepository.saveAndFlush(user);
-        return new UserResponse(saved.getId(), saved.getEmail(), saved.getCreatedAt());
+        try {
+            // saveAndFlush, not save: @CreationTimestamp is populated by
+            // Hibernate when the INSERT is actually written, which a plain
+            // save() defers to commit - without the flush, createdAt would
+            // come back null here even though it's NOT NULL in the database.
+            // The flush is also what makes the violation catchable here at
+            // all, rather than at commit time outside this method.
+            User saved = userRepository.saveAndFlush(user);
+            return new UserResponse(saved.getId(), saved.getEmail(), saved.getCreatedAt());
+        } catch (DataIntegrityViolationException emailTakenConcurrently) {
+            throw new EmailAlreadyExistsException(email);
+        }
     }
 
     @Override

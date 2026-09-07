@@ -16,6 +16,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.oauth2.jwt.Jwt;
@@ -82,6 +83,20 @@ class AuthServiceTest {
         when(userRepository.existsByEmail("taken@example.com")).thenReturn(true);
 
         assertThatThrownBy(() -> authService.register(new RegisterRequest("taken@example.com", "password123")))
+                .isInstanceOf(EmailAlreadyExistsException.class);
+    }
+
+    @Test
+    void register_emailTakenConcurrently_reportsTheSameConflictRatherThanTheRawViolation() {
+        // The lookup said the address was free, then a concurrent
+        // registration of it committed first. The caller's situation is
+        // identical to the ordinary duplicate, so the answer should be too -
+        // not the 500 a raw constraint violation would become.
+        when(userRepository.existsByEmail("racy@example.com")).thenReturn(false);
+        when(userRepository.saveAndFlush(any(User.class)))
+                .thenThrow(new DataIntegrityViolationException("duplicate key value violates unique constraint"));
+
+        assertThatThrownBy(() -> authService.register(new RegisterRequest("racy@example.com", "password123")))
                 .isInstanceOf(EmailAlreadyExistsException.class);
     }
 

@@ -425,6 +425,14 @@ small custom `JwtAuthenticationConverter` (the claim is a plain string, not
 the space-delimited `scope`/`scp` list Spring Security's default converter
 expects).
 
+**Registration splits the work the same way the ledger does.** `register`
+looks the address up first, which covers the ordinary "that email is taken"
+case cleanly. But two simultaneous registrations of the same address both
+see it as free and both insert, and no amount of looking first fixes that -
+so the `unique (email)` constraint arbitrates, and the loser's violation is
+translated into the same `409 EMAIL_ALREADY_EXISTS` the lookup would have
+produced rather than escaping as a 500.
+
 **Why account-service needs a service role at all.** A transfer credits the
 *destination* account, which by definition doesn't belong to whoever
 initiated the transfer - "does the caller own this account" can never be the
@@ -492,6 +500,12 @@ raises it. That's the whole category these tests exist for.
 - `notification-service`: `NotificationConsumerIT` - publishes real messages
   onto a real exchange and verifies consumption, idempotent redelivery, and
   the retry-then-dead-letter path.
+- `auth-service`: `AuthIT` - logs in and then decodes the returned token
+  against the JWK set the service itself publishes, which is the one thing
+  the unit test can't do at all (it mocks the `JwtEncoder`, so it never
+  proves a real RS256 token is produced, let alone that the published key
+  verifies it). Also covers concurrent registration of the same address, and
+  that the service-client credentials in `application.yml` actually bind.
 
 These are `*IT.java` classes run by `maven-failsafe-plugin`, gated behind an
 `integration-tests` Maven profile that's off by default. `verify` runs before
