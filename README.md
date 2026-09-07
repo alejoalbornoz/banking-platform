@@ -356,6 +356,17 @@ notification - a completed transfer notifies both the sender
 `processed_events` is what makes sure that pair is only ever created once no
 matter how many times the message shows up.
 
+That "the insert fails" step needed one non-obvious thing to actually be
+true. `ProcessedEvent`'s id is *assigned* (it's the event's own id, which is
+the whole point), and Spring Data decides between `persist` and `merge` by
+asking whether an entity is new - its default answer for a non-null assigned
+id being "not new". So `save` issued a `merge`, which on a redelivery found
+the existing row and quietly UPDATEd it: no constraint violation, no
+exception, and a second notification created every time. The constraint was
+never doing the work this design assumed it was. `ProcessedEvent` now
+implements `Persistable` and reports itself as always new, which forces the
+INSERT the deduplication depends on.
+
 This only works because `AccountCreatedEvent`, `TransferCompletedEvent`, and
 `TransferFailedEvent` can be faithfully reconstructed from JSON, `eventId`
 included. That wasn't true until this service needed it: each event class had
@@ -461,6 +472,15 @@ live for the first time surfaced a `@Lob`-on-a-TEXT-column mapping mismatch in
 `OutboxEvent` and a saga bug where `TransferService` reused a stale `@Version`
 across two saves, and unit tests had passed the whole time because a mocked
 `save()` just echoes its input instead of behaving like Hibernate's `merge()`.
+
+The third one arrived the first time these actually ran in CI:
+`NotificationConsumerIT` failed on a redelivered event producing two
+notifications, because `save` on an assigned-id entity merges instead of
+inserting and never tripped the primary key (see "Consuming idempotently"
+above). The unit test for that path had been green throughout - it mocks the
+repository to *throw* the constraint violation, so it proves the catch block
+handles one correctly while saying nothing about whether the database ever
+raises it. That's the whole category these tests exist for.
 
 - `account-service`: `AccountConcurrencyIT` - fires N concurrent credit
   requests at the same account, both with the same Idempotency-Key (must post
