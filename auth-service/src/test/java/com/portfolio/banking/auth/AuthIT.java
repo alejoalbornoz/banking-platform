@@ -6,6 +6,7 @@ import com.portfolio.banking.auth.dto.ServiceTokenRequest;
 import com.portfolio.banking.auth.dto.TokenResponse;
 import com.portfolio.banking.auth.dto.UserResponse;
 import com.portfolio.banking.auth.repository.IUserRepository;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -14,6 +15,7 @@ import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
@@ -74,6 +76,26 @@ class AuthIT {
 
     @Autowired
     private PasswordEncoder passwordEncoder;
+
+    /**
+     * Swaps out the request factory {@code TestRestTemplate} defaults to,
+     * which wraps the JDK's {@code HttpURLConnection}. That connection treats
+     * a 401 as an authentication challenge and tries to replay the request to
+     * answer it - and a POST body it has already written can't be replayed,
+     * so reading the response throws {@code HttpRetryException} and the 401
+     * never reaches the assertion. This is the only IT in the project that
+     * trips over it, because it's the only one asserting 401s; 403 and 409
+     * don't put that connection into its auth-handling path.
+     * <p>
+     * Buffering the request body is the usual suggestion and doesn't help
+     * here - the exception comes from reading the response, not writing the
+     * request. Going through {@code java.net.http.HttpClient} instead avoids
+     * the behaviour altogether, and needs no extra dependency.
+     */
+    @BeforeEach
+    void useAClientThatDoesntSwallow401s() {
+        restTemplate.getRestTemplate().setRequestFactory(new JdkClientHttpRequestFactory());
+    }
 
     @Test
     void register_persistsTheUserWithAHashedPassword() {
