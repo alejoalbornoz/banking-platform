@@ -576,6 +576,23 @@ surefire and failsafe reports are uploaded as an artifact, since the console
 output alone usually isn't enough to diagnose a failure you can't reproduce
 locally.
 
+**Two plugin bindings this project has to declare that most don't.** Both
+come from importing the Spring Boot BOM rather than inheriting
+`spring-boot-starter-parent`, which is also why `maven.compiler.parameters`
+is set by hand (see the root `pom.xml`):
+
+- The `repackage` execution. Without it the plugin is present but never
+  runs, and every module produces a plain jar with no `Main-Class`. That is
+  invisible for as long as everything is started with `spring-boot:run`, and
+  it surfaced the moment the Docker images tried `java -jar`.
+- Failsafe's `classesDirectory`. Adding `repackage` then broke the
+  integration tests, because failsafe tests the project's *artifact* and the
+  artifact is now a fat jar whose classes sit under `BOOT-INF/classes`. The
+  failure mode is worth knowing: not a missing class, but `failed to
+  discover tests` and zero tests run - a build that goes red without a
+  single integration test having started. Pointing failsafe back at
+  `${project.build.outputDirectory}` fixes it.
+
 ## Known gaps
 
 Being explicit about what is *not* solved yet, since these are the interesting

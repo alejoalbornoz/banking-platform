@@ -129,6 +129,18 @@
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-failsafe-plugin</artifactId>
                     <version>${maven-failsafe-plugin.version}</version>
+                    <configuration>
+                        <!-- Failsafe tests the project's artifact, which the
+                             repackage execution above turns into a Spring Boot
+                             fat jar - and in one of those the classes live
+                             under BOOT-INF/classes, where the JUnit engine
+                             can't see them. The symptom is not a missing
+                             class but silence: "failed to discover tests",
+                             zero tests run, and a build that fails without
+                             ever starting an IT. Pointing failsafe back at
+                             the plain output directory is the fix. -->
+                        <classesDirectory>${project.build.outputDirectory}</classesDirectory>
+                    </configuration>
                 </plugin>
             </plugins>
         </pluginManagement>
