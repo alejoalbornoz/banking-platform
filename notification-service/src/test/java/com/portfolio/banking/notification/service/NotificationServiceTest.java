@@ -6,11 +6,13 @@ import com.portfolio.banking.common.event.TransferFailedEvent;
 import com.portfolio.banking.notification.client.IAccountClient;
 import com.portfolio.banking.notification.client.dto.AccountView;
 import com.portfolio.banking.notification.dto.NotificationResponse;
+import com.portfolio.banking.notification.dto.PageResponse;
 import com.portfolio.banking.notification.exception.ForbiddenException;
 import com.portfolio.banking.notification.mapper.NotificationMapper;
 import com.portfolio.banking.notification.model.Notification;
 import com.portfolio.banking.notification.model.NotificationType;
 import com.portfolio.banking.notification.model.ProcessedEvent;
+import com.portfolio.banking.notification.pagination.KeysetPage;
 import com.portfolio.banking.notification.repository.INotificationRepository;
 import com.portfolio.banking.notification.repository.IProcessedEventRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -25,12 +27,14 @@ import org.springframework.transaction.TransactionStatus;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -161,14 +165,16 @@ class NotificationServiceTest {
         when(accountClient.getAccount(accountId)).thenReturn(new AccountView(accountId, ownerId));
         Notification notification = new Notification(
                 UUID.randomUUID(), accountId, NotificationType.ACCOUNT_CREATED, "Your account was opened.");
-        when(notificationRepository.findAllByRecipientAccountIdOrderByCreatedAtDesc(accountId))
+        when(notificationRepository.findFirstPageByRecipientAccountId(eq(accountId), any()))
                 .thenReturn(List.of(notification));
 
-        List<NotificationResponse> responses = notificationService.listForAccount(ownerId.toString(), accountId);
+        PageResponse<NotificationResponse> page =
+                notificationService.listForAccount(ownerId.toString(), accountId, KeysetPage.of(null, null));
 
-        assertThat(responses).hasSize(1);
-        assertThat(responses.get(0).recipientAccountId()).isEqualTo(accountId);
-        assertThat(responses.get(0).type()).isEqualTo("ACCOUNT_CREATED");
+        assertThat(page.items()).hasSize(1);
+        assertThat(page.items().get(0).recipientAccountId()).isEqualTo(accountId);
+        assertThat(page.items().get(0).type()).isEqualTo("ACCOUNT_CREATED");
+        assertThat(page.nextCursor()).isNull();
     }
 
     @Test
@@ -177,8 +183,28 @@ class NotificationServiceTest {
         when(accountClient.getAccount(accountId)).thenReturn(new AccountView(accountId, UUID.randomUUID()));
         String someoneElse = UUID.randomUUID().toString();
 
-        assertThatThrownBy(() -> notificationService.listForAccount(someoneElse, accountId))
+        assertThatThrownBy(() ->
+                notificationService.listForAccount(someoneElse, accountId, KeysetPage.of(null, null)))
                 .isInstanceOf(ForbiddenException.class);
-        verify(notificationRepository, never()).findAllByRecipientAccountIdOrderByCreatedAtDesc(any());
+        verify(notificationRepository, never()).findFirstPageByRecipientAccountId(any(), any());
+        verify(notificationRepository, never()).findPageByRecipientAccountIdAfter(any(), any(), any(), any());
+    }
+
+    /**
+     * The ownership check runs before the query on every page, not only on the
+     * first. A cursor is a client-supplied parameter like any other, so a
+     * caller who somehow obtained one for an account they don't own must not
+     * be able to read past page one with it.
+     */
+    @Test
+    void listForAccount_withACursor_stillChecksOwnershipBeforeReading() {
+        UUID accountId = UUID.randomUUID();
+        when(accountClient.getAccount(accountId)).thenReturn(new AccountView(accountId, UUID.randomUUID()));
+        KeysetPage secondPage = new KeysetPage(Instant.parse("2026-01-01T00:00:00Z"), UUID.randomUUID(), 20);
+
+        assertThatThrownBy(() ->
+                notificationService.listForAccount(UUID.randomUUID().toString(), accountId, secondPage))
+                .isInstanceOf(ForbiddenException.class);
+        verify(notificationRepository, never()).findPageByRecipientAccountIdAfter(any(), any(), any(), any());
     }
 }

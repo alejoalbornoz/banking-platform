@@ -4,8 +4,9 @@ import com.portfolio.banking.common.event.AccountCreatedEvent;
 import com.portfolio.banking.common.event.TransferCompletedEvent;
 import com.portfolio.banking.common.event.TransferFailedEvent;
 import com.portfolio.banking.notification.dto.NotificationResponse;
+import com.portfolio.banking.notification.dto.PageResponse;
+import com.portfolio.banking.notification.pagination.KeysetPage;
 
-import java.util.List;
 import java.util.UUID;
 
 public interface INotificationService {
@@ -30,5 +31,5 @@ public interface INotificationService {
      * @throws com.portfolio.banking.notification.exception.ForbiddenException
      *         if the caller doesn't own the account
      */
-    List<NotificationResponse> listForAccount(String callerId, UUID accountId);
+    PageResponse<NotificationResponse> listForAccount(String callerId, UUID accountId, KeysetPage page);
 }

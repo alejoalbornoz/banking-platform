@@ -4,7 +4,9 @@ import com.portfolio.banking.account.dto.AccountResponse;
 import com.portfolio.banking.account.dto.AmountRequest;
 import com.portfolio.banking.account.dto.CreateAccountRequest;
 import com.portfolio.banking.account.dto.LedgerResponse;
+import com.portfolio.banking.account.dto.PageResponse;
 import com.portfolio.banking.account.exception.ForbiddenException;
+import com.portfolio.banking.account.pagination.KeysetPage;
 import com.portfolio.banking.account.service.IAccountService;
 import jakarta.validation.Valid;
 import org.springframework.http.ResponseEntity;
@@ -16,11 +18,11 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.util.UriComponentsBuilder;
 
 import java.net.URI;
-import java.util.List;
 import java.util.UUID;
 
 @RestController
@@ -58,9 +60,18 @@ public class AccountController {
         return account;
     }
 
+    /**
+     * Paginated like every other list on this platform, even though most
+     * people hold two or three accounts. The response shape is what makes an
+     * endpoint safe to grow into: adding a cursor later is a breaking change
+     * for every client already parsing a bare array, so the cheap moment to
+     * decide is now, not once someone has ten thousand of something.
+     */
     @GetMapping
-    public List<AccountResponse> listAccounts(@AuthenticationPrincipal Jwt caller) {
-        return accountService.listAccountsByOwner(callerUuid(caller));
+    public PageResponse<AccountResponse> listAccounts(@AuthenticationPrincipal Jwt caller,
+                                                        @RequestParam(required = false) String cursor,
+                                                        @RequestParam(required = false) Integer limit) {
+        return accountService.listAccountsByOwner(callerUuid(caller), KeysetPage.of(cursor, limit));
     }
 
     /**
@@ -122,11 +133,18 @@ public class AccountController {
         return accountService.close(accountId);
     }
 
-    /** The account's statement, with a recomputed balance to prove it reconciles. */
+    /**
+     * One page of the account's statement, with a balance recomputed over the
+     * whole ledger to prove it reconciles - the reconciliation does not narrow
+     * to the page being read.
+     */
     @GetMapping("/{accountId}/ledger")
-    public LedgerResponse getLedger(@AuthenticationPrincipal Jwt caller, @PathVariable UUID accountId) {
+    public LedgerResponse getLedger(@AuthenticationPrincipal Jwt caller,
+                                      @PathVariable UUID accountId,
+                                      @RequestParam(required = false) String cursor,
+                                      @RequestParam(required = false) Integer limit) {
         assertOwnerOrService(caller, accountService.getAccount(accountId).ownerId());
-        return accountService.getLedger(accountId);
+        return accountService.getLedger(accountId, KeysetPage.of(cursor, limit));
     }
 
     private static String callerId(Jwt caller) {

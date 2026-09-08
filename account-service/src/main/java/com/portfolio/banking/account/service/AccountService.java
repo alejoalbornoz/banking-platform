@@ -3,6 +3,7 @@ package com.portfolio.banking.account.service;
 import com.portfolio.banking.account.dto.AccountResponse;
 import com.portfolio.banking.account.dto.CreateAccountRequest;
 import com.portfolio.banking.account.dto.LedgerResponse;
+import com.portfolio.banking.account.dto.PageResponse;
 import com.portfolio.banking.account.exception.ConcurrentUpdateException;
 import com.portfolio.banking.account.exception.OperationKeyReusedException;
 import com.portfolio.banking.account.exception.ResourceNotFoundException;
@@ -12,6 +13,7 @@ import com.portfolio.banking.account.messaging.IAccountEventPublisher;
 import com.portfolio.banking.account.model.Account;
 import com.portfolio.banking.account.model.LedgerDirection;
 import com.portfolio.banking.account.model.LedgerEntry;
+import com.portfolio.banking.account.pagination.KeysetPage;
 import com.portfolio.banking.account.repository.IAccountRepository;
 import com.portfolio.banking.account.repository.ILedgerEntryRepository;
 import com.portfolio.banking.common.event.AccountCreatedEvent;
@@ -37,6 +39,9 @@ public class AccountService implements IAccountService {
 
     private static final int ACCOUNT_NUMBER_LENGTH = 12;
     private static final int MAX_ACCOUNT_NUMBER_ATTEMPTS = 5;
+
+    /** Matches the NUMERIC(19,2) scale every money column in this service uses. */
+    private static final BigDecimal ZERO_BALANCE = BigDecimal.ZERO.setScale(2);
 
     private final IAccountRepository accountRepository;
     private final ILedgerEntryRepository ledgerEntryRepository;
@@ -139,18 +144,48 @@ public class AccountService implements IAccountService {
 
     @Override
     @Transactional(readOnly = true)
-    public List<AccountResponse> listAccountsByOwner(UUID ownerId) {
-        return accountRepository.findAllByOwnerId(ownerId).stream()
-                .map(accountMapper::toResponse)
-                .toList();
+    public PageResponse<AccountResponse> listAccountsByOwner(UUID ownerId, KeysetPage page) {
+        List<Account> fetched = page.isFirstPage()
+                ? accountRepository.findFirstPageByOwnerId(ownerId, page.limitOnly())
+                : accountRepository.findPageByOwnerIdAfter(
+                        ownerId, page.afterCreatedAt(), page.afterId(), page.limitOnly());
+
+        return page.build(fetched, accountMapper::toResponse, Account::getCreatedAt, Account::getId);
     }
 
+    /**
+     * The balance is summed by the database over every entry, while only one
+     * page of entries is fetched. Those are two different questions and they
+     * need two different queries: "does this account reconcile" is about the
+     * whole ledger, "what were the last twenty movements" is about a page.
+     * Answering the first from the second is what breaks the moment an account
+     * outgrows a single response.
+     * <p>
+     * Both run in the same read-only transaction, so the page and the total
+     * are read from one consistent snapshot rather than from two moments with
+     * a write in between.
+     */
     @Override
     @Transactional(readOnly = true)
-    public LedgerResponse getLedger(UUID accountId) {
+    public LedgerResponse getLedger(UUID accountId, KeysetPage page) {
         Account account = findAccountOrThrow(accountId);
-        return ledgerMapper.toLedgerResponse(
-                account, ledgerEntryRepository.findAllByAccountIdOrderByCreatedAtDesc(accountId));
+
+        List<LedgerEntry> fetched = page.isFirstPage()
+                ? ledgerEntryRepository.findFirstPageByAccountId(accountId, page.limitOnly())
+                : ledgerEntryRepository.findPageByAccountIdAfter(
+                        accountId, page.afterCreatedAt(), page.afterId(), page.limitOnly());
+
+        // Null, not zero, when the account has no entries at all - an account
+        // opened at zero is a real state, and SUM over no rows is null in SQL.
+        // The fallback carries the same scale the column does, so an empty
+        // ledger reports "0.00" like every other amount in the API rather than
+        // a bare "0".
+        BigDecimal computedBalance = Optional.ofNullable(
+                        ledgerEntryRepository.sumSignedAmountByAccountId(accountId, LedgerDirection.CREDIT))
+                .orElse(ZERO_BALANCE);
+
+        return ledgerMapper.toLedgerResponse(account, computedBalance,
+                page.build(fetched, ledgerMapper::toResponse, LedgerEntry::getCreatedAt, LedgerEntry::getId));
     }
 
     @Override

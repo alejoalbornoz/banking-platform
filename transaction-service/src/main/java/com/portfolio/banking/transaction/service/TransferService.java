@@ -7,6 +7,7 @@ import com.portfolio.banking.common.event.TransferFailedEvent;
 import com.portfolio.banking.transaction.alert.IStuckTransferAlerter;
 import com.portfolio.banking.transaction.client.IAccountClient;
 import com.portfolio.banking.transaction.client.dto.AccountView;
+import com.portfolio.banking.transaction.dto.PageResponse;
 import com.portfolio.banking.transaction.dto.TransferRequest;
 import com.portfolio.banking.transaction.dto.TransferResponse;
 import com.portfolio.banking.transaction.exception.CurrencyMismatchException;
@@ -17,6 +18,7 @@ import com.portfolio.banking.transaction.mapper.ITransactionMapper;
 import com.portfolio.banking.transaction.model.OutboxEvent;
 import com.portfolio.banking.transaction.model.Transaction;
 import com.portfolio.banking.transaction.model.TransactionStatus;
+import com.portfolio.banking.transaction.pagination.KeysetPage;
 import com.portfolio.banking.transaction.repository.IOutboxEventRepository;
 import com.portfolio.banking.transaction.repository.ITransactionRepository;
 import org.slf4j.Logger;
@@ -105,7 +107,7 @@ public class TransferService implements ITransferService {
         assertCurrencyMatches(sourceAccount, request);
         assertCurrencyMatches(accountClient.getAccount(request.destinationAccountId()), request);
 
-        Transaction transaction = findOrCreate(idempotencyKey, request);
+        Transaction transaction = findOrCreate(callerId, idempotencyKey, request);
 
         if (!transaction.matches(request.sourceAccountId(), request.destinationAccountId(),
                 request.amount(), request.currency())) {
@@ -132,6 +134,38 @@ public class TransferService implements ITransferService {
             throw new ForbiddenException("Not authorized to view this transfer");
         }
         return transactionMapper.toResponse(transaction);
+    }
+
+    /**
+     * Scoped by {@code initiated_by} rather than by account ownership, and
+     * that is a real difference worth naming: this returns the transfers the
+     * caller <em>sent</em>, not every transfer that touched their accounts.
+     * <p>
+     * The alternative would be to resolve the caller's accounts first and
+     * match either side against them, which is what {@link #getTransaction}
+     * does for a single row. It does not survive being turned into a list:
+     * ownership lives in account-service, so deciding it per row means one
+     * network call per row, and pushing the account ids into the query means
+     * fetching every account the caller owns before the first row can be
+     * read. Received money is already visible where it actually landed - in
+     * the account's own ledger, and in notification-service's
+     * {@code TRANSFER_RECEIVED} rows.
+     * <p>
+     * Transfers created before {@code initiated_by} existed have it null and
+     * so appear in nobody's history. They stay readable by id.
+     */
+    @Override
+    @Transactional(readOnly = true)
+    public PageResponse<TransferResponse> listMyTransfers(String callerId, KeysetPage page) {
+        UUID initiatedBy = UUID.fromString(callerId);
+
+        List<Transaction> fetched = page.isFirstPage()
+                ? transactionRepository.findFirstPageByInitiatedBy(initiatedBy, page.limitOnly())
+                : transactionRepository.findPageByInitiatedByAfter(
+                        initiatedBy, page.afterCreatedAt(), page.afterId(), page.limitOnly());
+
+        return page.build(fetched, transactionMapper::toResponse,
+                Transaction::getCreatedAt, Transaction::getId);
     }
 
     @Override
@@ -176,14 +210,15 @@ public class TransferService implements ITransferService {
         return callerId.equals(account.ownerId().toString());
     }
 
-    private Transaction findOrCreate(String idempotencyKey, TransferRequest request) {
+    private Transaction findOrCreate(String callerId, String idempotencyKey, TransferRequest request) {
         return transactionTemplate.execute(status -> {
             var existing = transactionRepository.findByIdempotencyKey(idempotencyKey);
             if (existing.isPresent()) {
                 return existing.get();
             }
             Transaction created = new Transaction(idempotencyKey, request.sourceAccountId(),
-                    request.destinationAccountId(), request.amount(), request.currency());
+                    request.destinationAccountId(), request.amount(), request.currency(),
+                    UUID.fromString(callerId));
             try {
                 return transactionRepository.save(created);
             } catch (DataIntegrityViolationException raceLost) {

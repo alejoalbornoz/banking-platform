@@ -12,6 +12,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.data.domain.Pageable;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.containers.RabbitMQContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -76,7 +77,7 @@ class NotificationConsumerIT {
 
         await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
             List<Notification> notifications =
-                    notificationRepository.findAllByRecipientAccountIdOrderByCreatedAtDesc(accountId);
+                    notificationRepository.findFirstPageByRecipientAccountId(accountId, Pageable.ofSize(200));
             assertThat(notifications).hasSize(1);
             assertThat(notifications.get(0).getMessage()).contains("123456789012", "100.00", "USD");
         });
@@ -100,7 +101,7 @@ class NotificationConsumerIT {
         rabbitTemplate.send(exchangeName, "account.created", messageOf(payload));
 
         await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
-                assertThat(notificationRepository.findAllByRecipientAccountIdOrderByCreatedAtDesc(accountId))
+                assertThat(notificationRepository.findFirstPageByRecipientAccountId(accountId, Pageable.ofSize(200)))
                         .as("one notification despite two deliveries of the same event")
                         .hasSize(1));
     }
@@ -115,9 +116,9 @@ class NotificationConsumerIT {
         publish("transfer.completed", event);
 
         await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
-            assertThat(notificationRepository.findAllByRecipientAccountIdOrderByCreatedAtDesc(sourceId))
+            assertThat(notificationRepository.findFirstPageByRecipientAccountId(sourceId, Pageable.ofSize(200)))
                     .hasSize(1);
-            assertThat(notificationRepository.findAllByRecipientAccountIdOrderByCreatedAtDesc(destinationId))
+            assertThat(notificationRepository.findFirstPageByRecipientAccountId(destinationId, Pageable.ofSize(200)))
                     .hasSize(1);
         });
     }

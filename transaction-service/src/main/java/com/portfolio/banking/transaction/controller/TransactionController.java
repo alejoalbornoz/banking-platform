@@ -1,7 +1,9 @@
 package com.portfolio.banking.transaction.controller;
 
+import com.portfolio.banking.transaction.dto.PageResponse;
 import com.portfolio.banking.transaction.dto.TransferRequest;
 import com.portfolio.banking.transaction.dto.TransferResponse;
+import com.portfolio.banking.transaction.pagination.KeysetPage;
 import com.portfolio.banking.transaction.service.ITransferService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
@@ -14,6 +16,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
@@ -40,6 +43,23 @@ public class TransactionController {
     @GetMapping("/{transactionId}")
     public TransferResponse getTransaction(@AuthenticationPrincipal Jwt caller, @PathVariable UUID transactionId) {
         return transferService.getTransaction(caller.getSubject(), transactionId);
+    }
+
+    /**
+     * The caller's own transfer history: the ones they sent, newest first.
+     * <p>
+     * Money that arrived is not here, and that is a scoping decision rather
+     * than an oversight - a received transfer is visible in the destination
+     * account's ledger and in its {@code TRANSFER_RECEIVED} notification.
+     * {@code TransferService.listMyTransfers} explains why answering
+     * "everything touching my accounts" from this service would cost one
+     * network call per row.
+     */
+    @GetMapping
+    public PageResponse<TransferResponse> listMyTransfers(@AuthenticationPrincipal Jwt caller,
+                                                            @RequestParam(required = false) String cursor,
+                                                            @RequestParam(required = false) Integer limit) {
+        return transferService.listMyTransfers(caller.getSubject(), KeysetPage.of(cursor, limit));
     }
 
     /**

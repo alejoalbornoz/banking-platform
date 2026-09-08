@@ -41,6 +41,18 @@ public class Transaction {
     @Column(name = "destination_account_id", nullable = false, updatable = false)
     private UUID destinationAccountId;
 
+    /**
+     * The user who asked for this transfer, from their JWT subject.
+     * <p>
+     * Nullable only because rows written before this column existed have no
+     * honest value to carry - see V2__add_initiated_by_to_transactions.sql.
+     * Every transfer created from now on sets it, and it is what makes "list
+     * my transfers" a single indexed query instead of one ownership lookup
+     * per row against account-service.
+     */
+    @Column(name = "initiated_by", updatable = false)
+    private UUID initiatedBy;
+
     @Column(nullable = false, precision = 19, scale = 2, updatable = false)
     private BigDecimal amount;
 
@@ -71,12 +83,13 @@ public class Transaction {
     }
 
     public Transaction(String idempotencyKey, UUID sourceAccountId, UUID destinationAccountId,
-                        BigDecimal amount, String currency) {
+                        BigDecimal amount, String currency, UUID initiatedBy) {
         this.idempotencyKey = idempotencyKey;
         this.sourceAccountId = sourceAccountId;
         this.destinationAccountId = destinationAccountId;
         this.amount = amount;
         this.currency = currency;
+        this.initiatedBy = initiatedBy;
         this.status = TransactionStatus.PENDING;
     }
 
@@ -127,6 +140,10 @@ public class Transaction {
 
     public UUID getDestinationAccountId() {
         return destinationAccountId;
+    }
+
+    public UUID getInitiatedBy() {
+        return initiatedBy;
     }
 
     public BigDecimal getAmount() {

@@ -14,6 +14,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.data.domain.Pageable;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpEntity;
@@ -55,11 +56,19 @@ import java.util.concurrent.TimeUnit;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Real Postgres and a real optimistic-lock race, not a mocked repository -
- * exactly the thing {@code AccountServiceTest}'s own comments say a unit test
- * structurally cannot exercise. Run by failsafe under {@code mvn verify}, not
- * surefire's {@code mvn test}, since it needs Docker; see the root pom for why
- * that split exists.
+ * The parts of account-service that a mocked repository structurally
+ * cannot exercise, run against a real Postgres. Two of them:
+ * <ul>
+ *   <li>A genuine optimistic-lock race - mocks never actually contend for a
+ *       row, which is exactly what {@code AccountServiceTest}'s own comments
+ *       say about it.</li>
+ *   <li>The paginated ledger: its reconciliation total is a JPQL
+ *       {@code SUM(CASE ...)} that only a database executes, and its cursor
+ *       has to survive a round trip through the timestamp precision Postgres
+ *       actually stores.</li>
+ * </ul>
+ * Run by failsafe under {@code mvn verify}, not surefire's {@code mvn test},
+ * since it needs Docker; see the root pom for why that split exists.
  * <p>
  * Both a Postgres and a RabbitMQ container are required for the Spring
  * context to even start: {@code RabbitMQConfig} declares a {@code
@@ -78,8 +87,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @Testcontainers
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
-@Import(AccountConcurrencyIT.TestSecurityConfig.class)
-class AccountConcurrencyIT {
+@Import(AccountIT.TestSecurityConfig.class)
+class AccountIT {
 
     private static final KeyPair TEST_KEY_PAIR = generateTestKeyPair();
 
@@ -116,7 +125,7 @@ class AccountConcurrencyIT {
         fireConcurrently(threadCount,
                 () -> creditWithClientRetry(account.id(), idempotencyKey, new BigDecimal("10.00")));
 
-        long postingsForThisKey = ledgerEntryRepository.findAllByAccountIdOrderByCreatedAtDesc(account.id()).stream()
+        long postingsForThisKey = ledgerEntryRepository.findFirstPageByAccountId(account.id(), Pageable.ofSize(200)).stream()
                 .filter(entry -> entry.getOperationKey().equals(idempotencyKey))
                 .count();
         assertThat(postingsForThisKey).as("exactly one posting despite %d concurrent requests", threadCount)
@@ -154,11 +163,102 @@ class AccountConcurrencyIT {
         assertThat(updated.balance()).as("all %d distinct credits applied, none lost to a lost update", threadCount)
                 .isEqualByComparingTo(expectedTotal);
 
-        assertThat(ledgerEntryRepository.findAllByAccountIdOrderByCreatedAtDesc(account.id()))
+        assertThat(ledgerEntryRepository.findFirstPageByAccountId(account.id(), Pageable.ofSize(200)))
                 .hasSize(threadCount);
     }
 
+    /**
+     * The paginated statement walked end to end against a real Postgres.
+     * <p>
+     * Two things here exist nowhere else in the test suite. The first is the
+     * reconciliation total: it is a JPQL {@code SUM(CASE ...)} that turns
+     * debits negative, and against a mocked repository that expression is just
+     * a string nobody executes - only a real database can say whether the sign
+     * convention survived the move out of Java. The second is the cursor
+     * making a full round trip through an actual query, so a mismatch between
+     * the timestamp precision Postgres stores and the one the cursor carries
+     * would show up here as a repeated or missing row.
+     * <p>
+     * The page size deliberately does not divide the row count: an exact
+     * multiple would hide a cursor handed out on a full final page, which
+     * leads the client to an empty one.
+     */
+    @Test
+    void ledgerPagination_walksEveryEntryOnceWhileReconcilingOverTheWholeLedger() {
+        TestAccount account = createAccount(new BigDecimal("100.00")); // the opening entry
+        for (int i = 0; i < 12; i++) {
+            postAmount(account.id(), "credit", "page-c-" + i, new BigDecimal("10.00"));
+        }
+        for (int i = 0; i < 4; i++) {
+            postAmount(account.id(), "debit", "page-d-" + i, new BigDecimal("5.00"));
+        }
+        // 17 entries in total; 100.00 + 120.00 - 20.00 = 200.00
+
+        List<UUID> seen = new ArrayList<>();
+        String cursor = null;
+        int pages = 0;
+
+        do {
+            String path = "/api/v1/accounts/" + account.id() + "/ledger?limit=5"
+                    + (cursor == null ? "" : "&cursor=" + cursor);
+            LedgerResponse page = getAsOwner(path, account.ownerToken(), LedgerResponse.class);
+
+            assertThat(page.computedBalance())
+                    .as("page %d still reports the total over every entry, not this page's subtotal", pages + 1)
+                    .isEqualByComparingTo("200.00");
+            assertThat(page.reconciled()).isTrue();
+
+            page.entries().items().forEach(entry -> seen.add(entry.id()));
+            cursor = page.entries().nextCursor();
+            pages++;
+        } while (cursor != null && pages < 20);
+
+        assertThat(pages).as("17 entries at 5 per page is 5+5+5+2").isEqualTo(4);
+        assertThat(seen).as("every entry returned exactly once").hasSize(17).doesNotHaveDuplicates();
+    }
+
+    /**
+     * A limit above the cap is clamped rather than refused, so a client asking
+     * for everything at once still gets a bounded response instead of an
+     * error - and, more to the point, instead of the whole table.
+     */
+    @Test
+    void ledgerPagination_clampsAnOversizedLimitInsteadOfReturningEverything() {
+        TestAccount account = createAccount(new BigDecimal("1.00"));
+
+        LedgerResponse page = getAsOwner(
+                "/api/v1/accounts/" + account.id() + "/ledger?limit=100000",
+                account.ownerToken(), LedgerResponse.class);
+
+        assertThat(page.entries().items()).hasSize(1);
+    }
+
+    @Test
+    void ledgerPagination_rejectsAMalformedCursorWithABadRequest() {
+        TestAccount account = createAccount(BigDecimal.ZERO);
+
+        HttpEntity<Void> entity = new HttpEntity<>(authHeaders(account.ownerToken()));
+        ResponseEntity<String> response = restTemplate.exchange(
+                "/api/v1/accounts/" + account.id() + "/ledger?cursor=obviously-not-a-cursor",
+                HttpMethod.GET, entity, String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(response.getBody()).contains("Malformed cursor");
+    }
+
     private record TestAccount(UUID id, String ownerToken) {
+    }
+
+    /** A single credit or debit, uncontended - no client retry needed. */
+    private void postAmount(UUID accountId, String operation, String idempotencyKey, BigDecimal amount) {
+        HttpHeaders headers = authHeaders(mintToken("test-transaction-service", "SERVICE"));
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.set("Idempotency-Key", idempotencyKey);
+
+        ResponseEntity<AccountResponse> response = restTemplate.postForEntity(
+                "/api/v1/accounts/" + accountId + "/" + operation,
+                new HttpEntity<>(new AmountRequest(amount), headers), AccountResponse.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
     }
 
     private TestAccount createAccount(BigDecimal openingBalance) {

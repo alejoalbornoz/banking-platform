@@ -1,7 +1,9 @@
 package com.portfolio.banking.transaction.service;
 
+import com.portfolio.banking.transaction.dto.PageResponse;
 import com.portfolio.banking.transaction.dto.TransferRequest;
 import com.portfolio.banking.transaction.dto.TransferResponse;
+import com.portfolio.banking.transaction.pagination.KeysetPage;
 
 import java.util.List;
 import java.util.UUID;
@@ -29,6 +31,17 @@ public interface ITransferService {
      *         if the caller owns neither the source nor the destination account
      */
     TransferResponse getTransaction(String callerId, UUID transactionId);
+
+    /**
+     * One page of the transfers {@code callerId} started, newest first.
+     * <p>
+     * Deliberately "sent by me", not "involving my accounts" - the second
+     * cannot be answered here without a per-row ownership lookup against
+     * account-service. Incoming money shows up in the account ledger and in
+     * notification-service instead. See the implementation for the full
+     * reasoning.
+     */
+    PageResponse<TransferResponse> listMyTransfers(String callerId, KeysetPage page);
 
     /**
      * Every transfer currently stuck in {@code COMPENSATION_FAILED} - money

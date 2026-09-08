@@ -205,7 +205,7 @@ class TransferSagaIT {
     @Test
     void resumingFromDebited_skipsDebitAndCompletesWithoutRepeatingIt() {
         String idempotencyKey = "saga-resume-" + UUID.randomUUID();
-        Transaction stuckAtDebited = new Transaction(idempotencyKey, sourceId, destinationId, amount, "USD");
+        Transaction stuckAtDebited = new Transaction(idempotencyKey, sourceId, destinationId, amount, "USD", ownerId);
         stuckAtDebited.markDebited();
         Transaction saved = transactionRepository.save(stuckAtDebited);
 

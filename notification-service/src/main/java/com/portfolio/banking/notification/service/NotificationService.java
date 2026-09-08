@@ -5,6 +5,8 @@ import com.portfolio.banking.common.event.TransferCompletedEvent;
 import com.portfolio.banking.common.event.TransferFailedEvent;
 import com.portfolio.banking.notification.client.IAccountClient;
 import com.portfolio.banking.notification.dto.NotificationResponse;
+import com.portfolio.banking.notification.dto.PageResponse;
+import com.portfolio.banking.notification.pagination.KeysetPage;
 import com.portfolio.banking.notification.exception.ForbiddenException;
 import com.portfolio.banking.notification.mapper.INotificationMapper;
 import com.portfolio.banking.notification.model.Notification;
@@ -81,14 +83,19 @@ public class NotificationService implements INotificationService {
      * explicit annotation is needed here for that part to be correct.
      */
     @Override
-    public List<NotificationResponse> listForAccount(String callerId, UUID accountId) {
+    public PageResponse<NotificationResponse> listForAccount(String callerId, UUID accountId, KeysetPage page) {
         var account = accountClient.getAccount(accountId);
         if (!callerId.equals(account.ownerId().toString())) {
             throw new ForbiddenException("Not authorized to view notifications for this account");
         }
-        return notificationRepository.findAllByRecipientAccountIdOrderByCreatedAtDesc(accountId).stream()
-                .map(notificationMapper::toResponse)
-                .toList();
+
+        List<Notification> fetched = page.isFirstPage()
+                ? notificationRepository.findFirstPageByRecipientAccountId(accountId, page.limitOnly())
+                : notificationRepository.findPageByRecipientAccountIdAfter(
+                        accountId, page.afterCreatedAt(), page.afterId(), page.limitOnly());
+
+        return page.build(fetched, notificationMapper::toResponse,
+                Notification::getCreatedAt, Notification::getId);
     }
 
     /**

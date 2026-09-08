@@ -6,6 +6,7 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.portfolio.banking.transaction.alert.IStuckTransferAlerter;
 import com.portfolio.banking.transaction.client.IAccountClient;
 import com.portfolio.banking.transaction.client.dto.AccountView;
+import com.portfolio.banking.transaction.dto.PageResponse;
 import com.portfolio.banking.transaction.dto.TransferRequest;
 import com.portfolio.banking.transaction.dto.TransferResponse;
 import com.portfolio.banking.transaction.exception.CurrencyMismatchException;
@@ -16,6 +17,7 @@ import com.portfolio.banking.transaction.exception.ResourceNotFoundException;
 import com.portfolio.banking.transaction.mapper.TransactionMapper;
 import com.portfolio.banking.transaction.model.OutboxEvent;
 import com.portfolio.banking.transaction.model.Transaction;
+import com.portfolio.banking.transaction.pagination.KeysetPage;
 import com.portfolio.banking.transaction.repository.IOutboxEventRepository;
 import com.portfolio.banking.transaction.repository.ITransactionRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -32,6 +34,7 @@ import org.springframework.transaction.TransactionStatus;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -42,6 +45,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.lenient;
@@ -229,7 +233,7 @@ class TransferServiceTest {
 
     @Test
     void transfer_replayOfCompletedTransaction_doesNotCallAccountClientAgain() {
-        Transaction alreadyCompleted = new Transaction("key-5", sourceId, destinationId, amount, "USD");
+        Transaction alreadyCompleted = new Transaction("key-5", sourceId, destinationId, amount, "USD", ownerId);
         alreadyCompleted.markCompleted();
         when(transactionRepository.findByIdempotencyKey("key-5")).thenReturn(Optional.of(alreadyCompleted));
 
@@ -243,7 +247,7 @@ class TransferServiceTest {
     @Test
     void transfer_sameKeyDifferentPayload_throwsIdempotencyKeyReusedException() {
         Transaction existingWithDifferentAmount =
-                new Transaction("key-6", sourceId, destinationId, new BigDecimal("999.00"), "USD");
+                new Transaction("key-6", sourceId, destinationId, new BigDecimal("999.00"), "USD", ownerId);
         when(transactionRepository.findByIdempotencyKey("key-6")).thenReturn(Optional.of(existingWithDifferentAmount));
 
         assertThatThrownBy(() -> transferService.transfer(callerId, "key-6", request))
@@ -254,7 +258,7 @@ class TransferServiceTest {
     void transfer_resumesFromDebitedState_skipsDebitStep() {
         // Simulates a previous attempt that crashed after the debit committed
         // but before the saga finished - the row is stuck in DEBITED.
-        Transaction debited = new Transaction("key-7", sourceId, destinationId, amount, "USD");
+        Transaction debited = new Transaction("key-7", sourceId, destinationId, amount, "USD", ownerId);
         debited.markDebited();
         when(transactionRepository.findByIdempotencyKey("key-7")).thenReturn(Optional.of(debited));
 
@@ -329,7 +333,7 @@ class TransferServiceTest {
     @Test
     void getTransaction_callerOwnsSource_returnsIt() {
         UUID transactionId = UUID.randomUUID();
-        Transaction completed = new Transaction("key-12", sourceId, destinationId, amount, "USD");
+        Transaction completed = new Transaction("key-12", sourceId, destinationId, amount, "USD", ownerId);
         completed.markDebited();
         completed.markCompleted();
         when(transactionRepository.findById(transactionId)).thenReturn(Optional.of(completed));
@@ -342,7 +346,7 @@ class TransferServiceTest {
     @Test
     void getTransaction_callerOwnsNeitherAccount_throwsForbidden() {
         UUID transactionId = UUID.randomUUID();
-        Transaction completed = new Transaction("key-13", sourceId, destinationId, amount, "USD");
+        Transaction completed = new Transaction("key-13", sourceId, destinationId, amount, "USD", ownerId);
         completed.markDebited();
         completed.markCompleted();
         when(transactionRepository.findById(transactionId)).thenReturn(Optional.of(completed));
@@ -356,7 +360,7 @@ class TransferServiceTest {
 
     @Test
     void listStuckTransfers_returnsOnlyCompensationFailedOnes() {
-        Transaction stuck = new Transaction("key-17", sourceId, destinationId, amount, "USD");
+        Transaction stuck = new Transaction("key-17", sourceId, destinationId, amount, "USD", ownerId);
         stuck.markDebited();
         stuck.markCompensationFailed("credit failed and compensation also failed");
         // Spelled out because Spring's own TransactionStatus is already
@@ -370,6 +374,47 @@ class TransferServiceTest {
         assertThat(stuckTransfers).hasSize(1);
         assertThat(stuckTransfers.get(0).status()).isEqualTo("COMPENSATION_FAILED");
         assertThat(stuckTransfers.get(0).sourceAccountId()).isEqualTo(sourceId);
+    }
+
+    @Test
+    void listMyTransfers_scopesToTheCallerWithoutAskingAccountServiceAnything() {
+        Transaction mine = new Transaction("key-18", sourceId, destinationId, amount, "USD", ownerId);
+        when(transactionRepository.findFirstPageByInitiatedBy(eq(ownerId), any())).thenReturn(List.of(mine));
+
+        PageResponse<TransferResponse> page = transferService.listMyTransfers(callerId, KeysetPage.of(null, null));
+
+        assertThat(page.items()).hasSize(1);
+        assertThat(page.items().get(0).sourceAccountId()).isEqualTo(sourceId);
+        assertThat(page.nextCursor()).isNull();
+        // The whole reason initiated_by exists: scoping a list by ownership
+        // would otherwise cost one getAccount call per row.
+        verify(accountClient, never()).getAccount(any());
+    }
+
+    @Test
+    void listMyTransfers_withACursor_resumesAfterThatRow() {
+        Instant position = Instant.parse("2026-01-01T00:00:00.123456Z");
+        UUID lastSeen = UUID.randomUUID();
+        when(transactionRepository.findPageByInitiatedByAfter(eq(ownerId), eq(position), eq(lastSeen), any()))
+                .thenReturn(List.of());
+
+        transferService.listMyTransfers(callerId, new KeysetPage(position, lastSeen, 20));
+
+        verify(transactionRepository, never()).findFirstPageByInitiatedBy(any(), any());
+    }
+
+    @Test
+    void transfer_recordsWhoInitiatedIt() {
+        // Without this, the transfer is invisible in its own author's history.
+        when(transactionRepository.save(any(Transaction.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        transferService.transfer(callerId, "key-19", request);
+
+        // atLeastOnce: the saga saves the same row three times as it walks
+        // PENDING -> DEBITED -> COMPLETED. Any capture is the same instance.
+        ArgumentCaptor<Transaction> captor = ArgumentCaptor.forClass(Transaction.class);
+        verify(transactionRepository, atLeastOnce()).save(captor.capture());
+        assertThat(captor.getAllValues().get(0).getInitiatedBy()).isEqualTo(ownerId);
     }
 
     @Test

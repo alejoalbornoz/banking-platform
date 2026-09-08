@@ -58,6 +58,6 @@ class StuckTransferAlerterTest {
 
     private static Transaction stuckTransfer() {
         return new Transaction("key-" + UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(),
-                new BigDecimal("50.00"), "USD");
+                new BigDecimal("50.00"), "USD", UUID.randomUUID());
     }
 }

@@ -45,6 +45,7 @@ approached rather than to run it:
 | [The outbox pattern](#reliable-events-the-outbox-pattern-transaction-service) | Committing and publishing are two systems; crash between them and they disagree forever |
 | [Idempotent consumption](#consuming-idempotently-and-dead-lettering-what-cant-be-handled-notification-service) | The same constraint trick on the consumer side, plus dead-lettering what can never be processed |
 | [Authentication](#authentication-auth-service-api-gateway) | RS256 and a published JWK set, and why crediting a transfer's destination can never pass an ownership check |
+| [Pagination](#paginating-the-lists-all-three-services) | Why a cursor and not an offset, and the reconciliation check that paginating a statement quietly turns into a lie |
 | [Integration tests](#integration-tests) | Three bugs that unit tests couldn't have caught, and exactly why each one was invisible |
 | [Known gaps](#known-gaps) | What isn't solved, and which of those were deliberate |
 
@@ -63,6 +64,7 @@ approached rather than to run it:
 - Interfaces are named `I<Name>` (`IAccountService`, `IAccountRepository`, `IAccountMapper`, `IAccountEventPublisher`); the implementation takes the plain name (`AccountService`, `AccountMapper`, `AccountEventPublisher`) and lives in the same package - no `impl` subpackage.
 - Entities live in `model` (not `domain`).
 - Each service owns its exceptions and DTOs under its own `exception`/`dto` packages. `common` is intentionally minimal: it only holds event payload contracts (`AccountCreatedEvent`, `TransferCompletedEvent`, `TransferFailedEvent`, `DomainEvent`), since those genuinely must be identical between a publisher and its consumers. Everything else is duplicated per service on purpose, to keep each service independently deployable and readable on its own.
+- That rule is why `KeysetPage`/`PageResponse` exist three times rather than in `common`, which is the one duplication here a reviewer is most likely to stop on. The test is whether two services must *agree* on a type, and they don't: a cursor minted by account-service is only ever handed back to account-service, so nothing breaks if the two drift. Event payloads fail that test, which is exactly why they live in `common` and this doesn't.
 
 ## Services
 
@@ -173,8 +175,14 @@ curl localhost:8080/api/v1/accounts/{id} -H "Authorization: Bearer {token}"
 # List your own accounts
 curl localhost:8080/api/v1/accounts -H "Authorization: Bearer {token}"
 
-# Read the statement, with the balance recomputed from the entries
-curl localhost:8080/api/v1/accounts/{id}/ledger -H "Authorization: Bearer {token}"
+# Read the statement. The balance is recomputed over the WHOLE ledger even
+# though only one page of entries comes back - see "Paginating the lists".
+curl "localhost:8080/api/v1/accounts/{id}/ledger?limit=5" -H "Authorization: Bearer {token}"
+
+# Next page: send back the nextCursor the previous response returned.
+# Keep going while nextCursor is non-null.
+curl "localhost:8080/api/v1/accounts/{id}/ledger?limit=5&cursor={nextCursor}" \
+  -H "Authorization: Bearer {token}"
 
 # Close your own account. Refused with a non-zero balance.
 curl -X POST localhost:8080/api/v1/accounts/{id}/close -H "Authorization: Bearer {token}"
@@ -231,6 +239,11 @@ happens.
 ```bash
 # Look up a transfer's final state (you must own the source or destination)
 curl localhost:8080/api/v1/transfers/{transactionId} -H "Authorization: Bearer {token}"
+
+# Your own transfer history: the ones you sent, newest first, paginated.
+# Money you received shows up in the ledger and in notifications instead -
+# see "Your own transfers" below for why.
+curl "localhost:8080/api/v1/transfers?limit=10" -H "Authorization: Bearer {token}"
 ```
 
 Traces for these requests show up in the Zipkin UI at http://localhost:9411 -
@@ -242,12 +255,15 @@ Nothing to call directly - it only listens. Create an account or run a
 transfer above, then check what it recorded (403 if `accountId` isn't yours):
 
 ```bash
-curl "localhost:8080/api/v1/notifications?accountId={accountId}" -H "Authorization: Bearer {token}"
+curl "localhost:8080/api/v1/notifications?accountId={accountId}&limit=10" \
+  -H "Authorization: Bearer {token}"
 ```
 
 A completed transfer produces two rows: one for the sender (`TRANSFER_SENT`)
 and one for the receiver (`TRANSFER_RECEIVED`), each queryable by their own
-account id.
+account id. Like every list here it comes back as `{ items, nextCursor }`;
+the ownership check runs on every page, not just the first, so a cursor for
+someone else's account is still a 403.
 
 ## How concurrency is handled (account-service)
 
@@ -598,6 +614,99 @@ check at the gateway would just duplicate the same validation against the
 same JWKS, not add a real second line of defense. It only exists so a client
 has one base URL and port (8080) instead of four.
 
+## Paginating the lists (all three services)
+
+Every list endpoint a user can reach returns a page, never a bare array (the
+one exception, `/transfers/stuck`, is ops-only and explained at the end):
+
+```json
+{ "items": [ ... ], "nextCursor": "MjAyNi0wOS0wOFQxMjowMDowMFp8..." }
+```
+
+A client pages by sending the previous response's `nextCursor` back as
+`?cursor=`, and stops when it comes back `null`. `?limit=` defaults to 20 and
+is **clamped** to 100 rather than rejected - a caller asking for more than we
+serve gets the most we will serve, and the cap is what stops `?limit=1000000`
+from being an unbounded read wearing a page's clothes.
+
+**Keyset, not offset.** These lists are append-only and sorted newest-first,
+so rows keep arriving at the front while a client reads. Under `OFFSET 20`
+that shifts the whole window: a row inserted between two requests pushes one
+the client already saw down into the next page, and it comes back twice. A
+cursor asks for what comes after *one specific row*, which no concurrent
+insert can change the meaning of. Offset also degrades as it grows - the
+database still walks and discards every skipped row - while a keyset is one
+index seek at any depth.
+
+**The sort key is `(created_at, id)`, not `created_at`.** Two rows can share a
+timestamp; two ledger entries posted in the same microsecond is not a
+hypothetical. A cursor pointing at a position several rows occupy can't say
+which of them was already returned, so the id breaks the tie - which is why
+each supporting index carries both columns (`V3` in account-service, `V2` in
+the other two).
+
+Two details that are easy to get wrong, both covered by `KeysetPageTest`:
+
+- **The query fetches `limit + 1` rows.** That extra row is never returned; it
+  only answers "is there another page?" without a second `COUNT` over the
+  table. Without it, a final page that happens to be exactly full is
+  indistinguishable from one with more behind it, and the client is handed a
+  cursor that leads to an empty page.
+- **The cursor's timestamp comes from a row the database returned**, never
+  from an `Instant.now()`. Postgres stores `timestamptz` to microseconds while
+  a Java `Instant` carries nanoseconds, so a locally-built timestamp would
+  compare unequal to the row it was meant to point at and the tiebreak would
+  quietly stop working.
+
+The cursor is base64url so it crosses a query string untouched and reads as
+opaque. That opacity is presentation, not security - anyone can decode it. It
+is encoded so clients treat it as a token to hand back rather than as a format
+to construct, which would freeze the sort key into the public API.
+
+### What paginating the ledger broke
+
+`GET /accounts/{id}/ledger` reports a `computedBalance` next to the stored one
+so the response can prove the two reconcile. That balance used to be the sum
+of the entries in the response - correct only while the response held *every*
+entry. The moment it holds twenty rows out of thousands, the same code is
+summing a page and calling it a reconciliation, and every account longer than
+one page reports itself as broken.
+
+So the total moved into the database, as its own query over all entries,
+while the page fetches only the page. Reconciliation is a claim about the
+whole ledger, so it has to be computed over the whole ledger; both run in one
+read-only transaction, so the page and the total come from a single consistent
+snapshot. `AccountServiceTest` pins this directly - a page holding one 10.00
+entry against a ledger totalling 75.00 must still report reconciled.
+
+That move also deleted `LedgerEntry.signedAmount()`: the credit-positive
+/debit-negative convention now lives in the SQL `CASE`, and a mocked
+repository can't execute it, which is why `AccountIT` re-checks it against a
+real Postgres with both directions in the ledger.
+
+### Your own transfers
+
+`GET /api/v1/transfers` is new, and it is scoped by a new `initiated_by`
+column rather than by account ownership - the transfers you **sent**, not
+every transfer that touched your accounts.
+
+That's a real scoping decision, not an oversight. Ownership lives in
+account-service, so deciding it per row means one network call per row, and
+pushing the account ids into the query means fetching every account you own
+before the first row can be read. `GET /transfers/{id}` can afford that check
+because it's one row. A list can't. Money that arrived is already visible
+where it landed - in the account's own ledger, and as a `TRANSFER_RECEIVED`
+notification.
+
+Transfers created before that column existed have it null and appear in
+nobody's history; they stay readable by id. Backfilling was not an option -
+this service never recorded who initiated them, and inventing a value would
+have been worse than admitting the gap.
+
+`GET /transfers/stuck` stays deliberately unpaginated. Its correct size is
+zero, and if it ever returns enough rows for paging to matter, the paging is
+not the problem.
+
 ## Integration tests
 
 Unit tests use Mockito, which is enough for business logic but structurally
@@ -621,10 +730,14 @@ repository to *throw* the constraint violation, so it proves the catch block
 handles one correctly while saying nothing about whether the database ever
 raises it. That's the whole category these tests exist for.
 
-- `account-service`: `AccountConcurrencyIT` - fires N concurrent credit
-  requests at the same account, both with the same Idempotency-Key (must post
-  exactly once) and with distinct keys (all must apply, none lost to a lost
-  update).
+- `account-service`: `AccountIT` - fires N concurrent credit requests at the
+  same account, both with the same Idempotency-Key (must post exactly once)
+  and with distinct keys (all must apply, none lost to a lost update). It
+  also walks the paginated ledger to the last page, because two things there
+  exist only in the database: the reconciliation total is a JPQL
+  `SUM(CASE ...)` that a mocked repository never executes, and the cursor has
+  to survive a round trip through the timestamp precision Postgres actually
+  stores.
 - `transaction-service`: `TransferSagaIT` - the saga against a real Postgres,
   with only the HTTP call to account-service mocked, covering the happy path,
   the compensation path, and resuming a transfer stuck at `DEBITED`.
@@ -725,6 +838,12 @@ parts:
   don't ship the registry that serves it.** Only transaction-service has
   `micrometer-registry-prometheus`, added because that's where the alert
   metric lives. The others' exposure line is currently dead config.
+- **There is no single "all my movements" view.** `GET /transfers` lists what
+  you sent; what you received is in the account ledger and in notifications.
+  Assembling one merged, paginated timeline across two services means either
+  a read model fed by the existing events or a query service that fans out
+  and merges - a real design decision, not a missing endpoint, so it isn't
+  faked here with something that only works while the data is small.
 - **No refresh tokens or revocation.** A leaked token is valid until it
   expires (1 hour for a user token, 12 for a service token) - there's no way
   to invalidate one early short of restarting auth-service, which invalidates

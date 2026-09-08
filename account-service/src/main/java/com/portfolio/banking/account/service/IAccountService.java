@@ -3,9 +3,10 @@ package com.portfolio.banking.account.service;
 import com.portfolio.banking.account.dto.AccountResponse;
 import com.portfolio.banking.account.dto.CreateAccountRequest;
 import com.portfolio.banking.account.dto.LedgerResponse;
+import com.portfolio.banking.account.dto.PageResponse;
+import com.portfolio.banking.account.pagination.KeysetPage;
 
 import java.math.BigDecimal;
-import java.util.List;
 import java.util.UUID;
 
 public interface IAccountService {
@@ -16,7 +17,8 @@ public interface IAccountService {
 
     AccountResponse getAccountByNumber(String accountNumber);
 
-    List<AccountResponse> listAccountsByOwner(UUID ownerId);
+    /** One page of the accounts belonging to {@code ownerId}, newest first. */
+    PageResponse<AccountResponse> listAccountsByOwner(UUID ownerId, KeysetPage page);
 
     /**
      * Credits (adds funds to) an account, exactly once per
@@ -48,10 +50,12 @@ public interface IAccountService {
     AccountResponse debit(UUID accountId, String operationKey, BigDecimal amount);
 
     /**
-     * The account's full statement, plus a recomputed balance so the caller
-     * can see that the stored balance and the ledger agree.
+     * One page of the account statement, plus a balance recomputed over the
+     * whole ledger so the caller can see that the stored balance and the
+     * entries agree - a check that stays meaningful no matter which page of
+     * the statement this is.
      */
-    LedgerResponse getLedger(UUID accountId);
+    LedgerResponse getLedger(UUID accountId, KeysetPage page);
 
     /**
      * Blocks outgoing transfers while still accepting incoming ones. Safe to

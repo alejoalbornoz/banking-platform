@@ -14,6 +14,7 @@ import com.portfolio.banking.account.messaging.IAccountEventPublisher;
 import com.portfolio.banking.account.model.Account;
 import com.portfolio.banking.account.model.LedgerDirection;
 import com.portfolio.banking.account.model.LedgerEntry;
+import com.portfolio.banking.account.pagination.KeysetPage;
 import com.portfolio.banking.account.repository.IAccountRepository;
 import com.portfolio.banking.account.repository.ILedgerEntryRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -32,6 +33,7 @@ import org.springframework.transaction.TransactionStatus;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -306,18 +308,23 @@ class AccountServiceTest {
     @Test
     void getLedger_reportsStoredAndRecomputedBalanceAsReconciled() {
         when(accountRepository.findById(accountId)).thenReturn(Optional.of(accountWith("75.00")));
-        when(ledgerEntryRepository.findAllByAccountIdOrderByCreatedAtDesc(accountId)).thenReturn(List.of(
+        when(ledgerEntryRepository.findFirstPageByAccountId(eq(accountId), any())).thenReturn(List.of(
                 new LedgerEntry(accountId, "op-2", LedgerDirection.DEBIT,
                         new BigDecimal("25.00"), "USD", new BigDecimal("75.00")),
                 new LedgerEntry(accountId, LedgerEntry.OPENING_OPERATION_KEY, LedgerDirection.CREDIT,
                         new BigDecimal("100.00"), "USD", new BigDecimal("100.00"))));
+        when(ledgerEntryRepository.sumSignedAmountByAccountId(accountId, LedgerDirection.CREDIT))
+                .thenReturn(new BigDecimal("75.00"));
 
-        LedgerResponse ledger = accountService.getLedger(accountId);
+        LedgerResponse ledger = accountService.getLedger(accountId, KeysetPage.of(null, null));
 
         assertThat(ledger.storedBalance()).isEqualByComparingTo("75.00");
         assertThat(ledger.computedBalance()).isEqualByComparingTo("75.00");
         assertThat(ledger.reconciled()).isTrue();
-        assertThat(ledger.entries()).hasSize(2);
+        assertThat(ledger.entries().items()).hasSize(2);
+        assertThat(ledger.entries().nextCursor())
+                .as("two entries fit in one page, so there is nothing to page to")
+                .isNull();
     }
 
     @Test
@@ -327,35 +334,81 @@ class AccountServiceTest {
         // does break, it surfaces as a visible flag rather than as quietly
         // wrong money.
         when(accountRepository.findById(accountId)).thenReturn(Optional.of(accountWith("999.00")));
-        when(ledgerEntryRepository.findAllByAccountIdOrderByCreatedAtDesc(accountId)).thenReturn(List.of(
+        when(ledgerEntryRepository.findFirstPageByAccountId(eq(accountId), any())).thenReturn(List.of(
                 new LedgerEntry(accountId, LedgerEntry.OPENING_OPERATION_KEY, LedgerDirection.CREDIT,
                         new BigDecimal("100.00"), "USD", new BigDecimal("100.00"))));
+        when(ledgerEntryRepository.sumSignedAmountByAccountId(accountId, LedgerDirection.CREDIT))
+                .thenReturn(new BigDecimal("100.00"));
 
-        LedgerResponse ledger = accountService.getLedger(accountId);
+        LedgerResponse ledger = accountService.getLedger(accountId, KeysetPage.of(null, null));
 
         assertThat(ledger.reconciled()).isFalse();
         assertThat(ledger.storedBalance()).isEqualByComparingTo("999.00");
         assertThat(ledger.computedBalance()).isEqualByComparingTo("100.00");
     }
 
+    /**
+     * The regression test for the trap paginating a statement opens: the
+     * balance used to be recomputed by summing the entries in the response,
+     * which silently became a page subtotal the moment the response held a
+     * page. Here the page shows one 10.00 entry while the ledger as a whole
+     * sums to 75.00 - summing the page would report a perfectly healthy
+     * account as unreconciled.
+     */
     @Test
-    void ledgerEntries_sumToTheBalanceRegardlessOfDirection() {
-        // Guards the sign convention on LedgerDirection: amounts are always
-        // stored positive, so a bug there would show up as a debit that
-        // increases the balance.
-        when(accountRepository.findById(accountId)).thenReturn(Optional.of(accountWith("30.00")));
-        when(ledgerEntryRepository.findAllByAccountIdOrderByCreatedAtDesc(eq(accountId))).thenReturn(List.of(
-                new LedgerEntry(accountId, "d2", LedgerDirection.DEBIT,
-                        new BigDecimal("40.00"), "USD", new BigDecimal("30.00")),
-                new LedgerEntry(accountId, "c1", LedgerDirection.CREDIT,
-                        new BigDecimal("20.00"), "USD", new BigDecimal("70.00")),
-                new LedgerEntry(accountId, LedgerEntry.OPENING_OPERATION_KEY, LedgerDirection.CREDIT,
-                        new BigDecimal("50.00"), "USD", new BigDecimal("50.00"))));
+    void getLedger_reconciliationIsComputedOverTheWholeLedgerNotOverThePage() {
+        when(accountRepository.findById(accountId)).thenReturn(Optional.of(accountWith("75.00")));
+        when(ledgerEntryRepository.findFirstPageByAccountId(eq(accountId), any())).thenReturn(List.of(
+                new LedgerEntry(accountId, "most-recent", LedgerDirection.CREDIT,
+                        new BigDecimal("10.00"), "USD", new BigDecimal("75.00"))));
+        when(ledgerEntryRepository.sumSignedAmountByAccountId(accountId, LedgerDirection.CREDIT))
+                .thenReturn(new BigDecimal("75.00"));
 
-        LedgerResponse ledger = accountService.getLedger(accountId);
+        LedgerResponse ledger = accountService.getLedger(accountId, KeysetPage.of(null, 1));
 
-        assertThat(ledger.computedBalance()).isEqualByComparingTo("30.00");
+        assertThat(ledger.computedBalance()).isEqualByComparingTo("75.00");
         assertThat(ledger.reconciled()).isTrue();
+        assertThat(ledger.entries().items()).hasSize(1);
+    }
+
+    /**
+     * SUM over no rows is null in SQL, and an account opened at zero
+     * genuinely has no entries. Reporting that as a null balance - or worse,
+     * throwing - would make a legitimate account look broken.
+     */
+    @Test
+    void getLedger_withNoEntriesAtAll_reportsZeroRatherThanNull() {
+        when(accountRepository.findById(accountId)).thenReturn(Optional.of(accountWith("0.00")));
+        when(ledgerEntryRepository.findFirstPageByAccountId(eq(accountId), any())).thenReturn(List.of());
+        when(ledgerEntryRepository.sumSignedAmountByAccountId(accountId, LedgerDirection.CREDIT))
+                .thenReturn(null);
+
+        LedgerResponse ledger = accountService.getLedger(accountId, KeysetPage.of(null, null));
+
+        assertThat(ledger.computedBalance()).isEqualByComparingTo("0.00");
+        assertThat(ledger.reconciled()).isTrue();
+        assertThat(ledger.entries().items()).isEmpty();
+    }
+
+    /**
+     * A cursor has to route the read to the "after this row" query - taking
+     * the first-page query instead would restart the statement from the top
+     * and loop the client forever.
+     */
+    @Test
+    void getLedger_withACursor_resumesAfterThatRowInsteadOfRestarting() {
+        Instant position = Instant.parse("2026-01-01T00:00:00.123456Z");
+        UUID lastSeen = UUID.randomUUID();
+        when(accountRepository.findById(accountId)).thenReturn(Optional.of(accountWith("10.00")));
+        when(ledgerEntryRepository.findPageByAccountIdAfter(eq(accountId), eq(position), eq(lastSeen), any()))
+                .thenReturn(List.of());
+        when(ledgerEntryRepository.sumSignedAmountByAccountId(accountId, LedgerDirection.CREDIT))
+                .thenReturn(new BigDecimal("10.00"));
+
+        accountService.getLedger(accountId, new KeysetPage(position, lastSeen, 20));
+
+        verify(ledgerEntryRepository).findPageByAccountIdAfter(eq(accountId), eq(position), eq(lastSeen), any());
+        verify(ledgerEntryRepository, never()).findFirstPageByAccountId(any(), any());
     }
 
     @Test

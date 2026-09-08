@@ -100,10 +100,6 @@ public class LedgerEntry {
         return this.direction == direction && this.amount.compareTo(amount) == 0;
     }
 
-    /** This entry's contribution to the account's balance: positive for a credit, negative for a debit. */
-    public BigDecimal signedAmount() {
-        return direction.signed(amount);
-    }
 
     public UUID getId() {
         return id;

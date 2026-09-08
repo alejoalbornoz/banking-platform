@@ -2,12 +2,12 @@ package com.portfolio.banking.account.mapper;
 
 import com.portfolio.banking.account.dto.LedgerEntryResponse;
 import com.portfolio.banking.account.dto.LedgerResponse;
+import com.portfolio.banking.account.dto.PageResponse;
 import com.portfolio.banking.account.model.Account;
 import com.portfolio.banking.account.model.LedgerEntry;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
-import java.util.List;
 
 @Component
 public class LedgerMapper implements ILedgerMapper {
@@ -26,11 +26,9 @@ public class LedgerMapper implements ILedgerMapper {
     }
 
     @Override
-    public LedgerResponse toLedgerResponse(Account account, List<LedgerEntry> entries) {
-        BigDecimal computedBalance = entries.stream()
-                .map(LedgerEntry::signedAmount)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
-
+    public LedgerResponse toLedgerResponse(Account account,
+                                            BigDecimal computedBalance,
+                                            PageResponse<LedgerEntryResponse> entries) {
         return new LedgerResponse(
                 account.getId(),
                 account.getBalance(),
@@ -39,7 +37,7 @@ public class LedgerMapper implements ILedgerMapper {
                 // against "100.00" because it compares scale too, which would
                 // make a perfectly reconciled account report as broken.
                 account.getBalance().compareTo(computedBalance) == 0,
-                entries.stream().map(this::toResponse).toList()
+                entries
         );
     }
 }
