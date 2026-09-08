@@ -1,10 +1,12 @@
 package com.portfolio.banking.auth;
 
 import com.portfolio.banking.auth.dto.LoginRequest;
+import com.portfolio.banking.auth.dto.RefreshTokenRequest;
 import com.portfolio.banking.auth.dto.RegisterRequest;
 import com.portfolio.banking.auth.dto.ServiceTokenRequest;
 import com.portfolio.banking.auth.dto.TokenResponse;
 import com.portfolio.banking.auth.dto.UserResponse;
+import com.portfolio.banking.auth.repository.IRefreshTokenRepository;
 import com.portfolio.banking.auth.repository.IUserRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -53,6 +55,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li><b>Configuration binding.</b> The unit test constructs
  *       {@code ServiceClientsProperties} by hand; only a real context proves
  *       the credentials in application.yml actually bind.</li>
+ *   <li><b>Refresh token family revocation.</b> The unit test can assert
+ *       that {@code revokeFamily} was called; whether that UPDATE really
+ *       reaches every descendant of a login is a claim about SQL, and only a
+ *       database settles it.</li>
  * </ul>
  * No RabbitMQ container here - unlike the other three services, this one
  * publishes and consumes nothing.
@@ -73,6 +79,9 @@ class AuthIT {
 
     @Autowired
     private IUserRepository userRepository;
+
+    @Autowired
+    private IRefreshTokenRepository refreshTokenRepository;
 
     @Autowired
     private PasswordEncoder passwordEncoder;
@@ -210,6 +219,133 @@ class AuthIT {
                     assertThat(r.getBody()).contains("EMAIL_ALREADY_EXISTS");
                 });
         assertThat(userRepository.findByEmail(email)).isPresent();
+    }
+
+    @Test
+    void refresh_rotatesTheTokenAndTheNewAccessTokenStillVerifies() {
+        Session session = registerAndLogIn();
+
+        ResponseEntity<TokenResponse> refreshed = restTemplate.postForEntity(
+                "/api/v1/auth/refresh", new RefreshTokenRequest(session.refreshToken()), TokenResponse.class);
+
+        assertThat(refreshed.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(refreshed.getBody().refreshToken())
+                .as("rotation: the caller must be handed a different token")
+                .isNotEqualTo(session.refreshToken());
+
+        Jwt decoded = jwksBackedDecoder().decode(refreshed.getBody().accessToken());
+        assertThat(decoded.getSubject()).isEqualTo(session.userId().toString());
+        assertThat(decoded.getClaimAsString("role")).isEqualTo("USER");
+    }
+
+    /**
+     * The whole mechanism, end to end, and the reason this belongs in an IT
+     * rather than in {@code AuthServiceTest}: the unit test can only verify
+     * that {@code revokeFamily} was <em>called</em>. Whether that call
+     * actually reaches every descendant of the login - including the
+     * perfectly valid token handed out one call earlier - is a claim about a
+     * SQL UPDATE, and only a database can settle it.
+     * <p>
+     * The scenario is a theft. The attacker replays a token the real client
+     * already spent; both are then locked out, which is the intended
+     * outcome. Nothing here can tell victim from thief, so it distrusts both.
+     */
+    @Test
+    void refresh_reusingASpentToken_killsEveryTokenInTheFamily() {
+        Session session = registerAndLogIn();
+
+        String secondToken = restTemplate.postForEntity("/api/v1/auth/refresh",
+                        new RefreshTokenRequest(session.refreshToken()), TokenResponse.class)
+                .getBody().refreshToken();
+
+        // The stolen copy of the first token, replayed after the real client
+        // already exchanged it.
+        ResponseEntity<String> replay = restTemplate.postForEntity("/api/v1/auth/refresh",
+                new RefreshTokenRequest(session.refreshToken()), String.class);
+        assertThat(replay.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+
+        // And the currently-valid token dies with it. Without the family, the
+        // attacker would simply keep refreshing from whichever token they
+        // hold.
+        ResponseEntity<String> afterRevocation = restTemplate.postForEntity("/api/v1/auth/refresh",
+                new RefreshTokenRequest(secondToken), String.class);
+        assertThat(afterRevocation.getStatusCode())
+                .as("the successor is revoked too, not just the replayed token")
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
+    @Test
+    void logout_endsTheSessionAndIsSafeToRepeat() {
+        Session session = registerAndLogIn();
+
+        assertThat(logout(session.refreshToken()).getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+
+        ResponseEntity<String> afterLogout = restTemplate.postForEntity("/api/v1/auth/refresh",
+                new RefreshTokenRequest(session.refreshToken()), String.class);
+        assertThat(afterLogout.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+
+        // Idempotent, and just as silent for a token it no longer honours as
+        // for one it never issued.
+        assertThat(logout(session.refreshToken()).getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(logout("a-token-that-was-never-issued").getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+    }
+
+    /**
+     * Two sessions for one user must be independent - signing out of a laptop
+     * cannot sign the phone out too. Each login starts its own family, and
+     * this is what proves the revocation is scoped to one.
+     */
+    @Test
+    void logout_endsOnlyTheSessionItWasGiven() {
+        String email = uniqueEmail();
+        restTemplate.postForEntity("/api/v1/auth/register",
+                new RegisterRequest(email, "password123"), UserResponse.class);
+        String laptop = logIn(email).refreshToken();
+        String phone = logIn(email).refreshToken();
+
+        logout(laptop);
+
+        assertThat(restTemplate.postForEntity("/api/v1/auth/refresh",
+                new RefreshTokenRequest(phone), String.class).getStatusCode())
+                .as("the other session is untouched")
+                .isEqualTo(HttpStatus.OK);
+    }
+
+    /**
+     * The refresh token is a bearer credential with a far longer life than
+     * the access token, so a dump of this table must not be a dump of live
+     * sessions.
+     */
+    @Test
+    void refreshTokens_areStoredOnlyAsHashes() {
+        Session session = registerAndLogIn();
+
+        assertThat(refreshTokenRepository.findAll())
+                .isNotEmpty()
+                .as("the token itself is never written down")
+                .noneMatch(stored -> stored.getTokenHash().equals(session.refreshToken()));
+    }
+
+    private record Session(UUID userId, String refreshToken) {
+    }
+
+    private Session registerAndLogIn() {
+        String email = uniqueEmail();
+        UUID userId = restTemplate.postForEntity("/api/v1/auth/register",
+                        new RegisterRequest(email, "password123"), UserResponse.class)
+                .getBody().id();
+        TokenResponse tokens = logIn(email);
+        return new Session(userId, tokens.refreshToken());
+    }
+
+    private TokenResponse logIn(String email) {
+        return restTemplate.postForEntity("/api/v1/auth/login",
+                new LoginRequest(email, "password123"), TokenResponse.class).getBody();
+    }
+
+    private ResponseEntity<Void> logout(String refreshToken) {
+        return restTemplate.postForEntity(
+                "/api/v1/auth/logout", new RefreshTokenRequest(refreshToken), Void.class);
     }
 
     /** Exactly how the other services validate a token: fetch the JWK set, verify against it. */

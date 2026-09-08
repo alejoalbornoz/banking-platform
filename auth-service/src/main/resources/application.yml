@@ -26,16 +26,30 @@ spring:
 
 banking:
   jwt:
-    # Tokens a human logs in with. Short-lived on purpose: there's no refresh
-    # or revocation yet (see the README), so the only thing bounding a leaked
-    # token's blast radius is how soon it expires.
-    user-token-ttl-seconds: 3600
+    # Tokens a human logs in with. Fifteen minutes, and that is only viable
+    # because refresh tokens exist now: an access token is a bearer credential
+    # that nothing can revoke - every service validates it offline against the
+    # JWK set and never asks us about it - so the only thing bounding a leaked
+    # one is how soon it expires. The session's actual length is the refresh
+    # token's, below, and that one IS revocable.
+    user-token-ttl-seconds: 900
     # Tokens held by trusted internal processes (transaction-service calling
     # account-service's /credit and /debit, notification-service calling
     # account-service's /accounts/{id} to check ownership). Longer-lived than
     # a user token since it's not carried around by a browser - fewer
     # re-issuances to worry about.
     service-token-ttl-seconds: 43200
+    # How long a session can be kept alive by refreshing. Long, because this
+    # is the credential that can actually be taken away: it lives in the
+    # database, every exchange rotates it, and revoking its family ends the
+    # session immediately.
+    refresh-token-ttl-seconds: 2592000   # 30 days
+    # Rotation writes a row per refresh, so RefreshTokenCleanup deletes the
+    # long-expired ones. Kept a week past expiry on purpose - a reuse attempt
+    # against a just-expired token should read as expired in the logs, not as
+    # a token that never existed.
+    refresh-token-retention-after-expiry-seconds: 604800   # 7 days
+    refresh-token-cleanup-interval-ms: 3600000             # hourly
   security:
     # Service-to-service credentials, not user accounts - deliberately kept
     # out of the `users` table. Real deployments would pull secrets like this

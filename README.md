@@ -45,6 +45,7 @@ approached rather than to run it:
 | [The outbox pattern](#reliable-events-the-outbox-pattern-transaction-service) | Committing and publishing are two systems; crash between them and they disagree forever |
 | [Idempotent consumption](#consuming-idempotently-and-dead-lettering-what-cant-be-handled-notification-service) | The same constraint trick on the consumer side, plus dead-lettering what can never be processed |
 | [Authentication](#authentication-auth-service-api-gateway) | RS256 and a published JWK set, and why crediting a transfer's destination can never pass an ownership check |
+| [Refresh tokens](#refresh-tokens-rotation-and-detecting-theft) | How rotation turns a stolen token from undetectable into self-announcing, and why the revocation needs its own transaction |
 | [Pagination](#paginating-the-lists-all-three-services) | Why a cursor and not an offset, and the reconciliation check that paginating a statement quietly turns into a lie |
 | [Integration tests](#integration-tests) | Three bugs that unit tests couldn't have caught, and exactly why each one was invisible |
 | [Known gaps](#known-gaps) | What isn't solved, and which of those were deliberate |
@@ -151,11 +152,29 @@ curl -X POST localhost:8080/api/v1/auth/register \
   -H "Content-Type: application/json" \
   -d '{"email":"alice@example.com","password":"password123"}'
 
-# Copy the accessToken from the response for every call below.
+# Returns BOTH an accessToken (15 min, used on every call below) and a
+# refreshToken (30 days). Copy both.
 curl -X POST localhost:8080/api/v1/auth/login \
   -H "Content-Type: application/json" \
   -d '{"email":"alice@example.com","password":"password123"}'
+
+# When the access token expires, trade the refresh token for a new pair.
+# The one you send is consumed - store the new one, because sending the old
+# one again is read as theft and kills the whole session. See
+# "Refresh tokens" below.
+curl -X POST localhost:8080/api/v1/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d '{"refreshToken":"{refreshToken}"}'
+
+# End the session. 204 whether or not the token was recognised.
+curl -X POST localhost:8080/api/v1/auth/logout \
+  -H "Content-Type: application/json" \
+  -d '{"refreshToken":"{refreshToken}"}'
 ```
+
+Try sending the *same* `refreshToken` to `/refresh` twice: the second call
+gets `401`, and so does the token the first call handed you - a replayed
+token is treated as a stolen one, and the whole family goes.
 
 ### account-service
 
@@ -614,6 +633,118 @@ check at the gateway would just duplicate the same validation against the
 same JWKS, not add a real second line of defense. It only exists so a client
 has one base URL and port (8080) instead of four.
 
+### Refresh tokens: rotation, and detecting theft
+
+An access token cannot be revoked. That is not a shortcoming of this
+implementation, it is what makes it fast: every service validates it offline
+against the JWK set and never asks auth-service anything. The price is that a
+leaked one stays good until it expires, and the only lever is to expire it
+soon — which was why user tokens lasted an hour and there was nothing else
+holding a session together.
+
+Now a login returns two things:
+
+```json
+{ "accessToken": "eyJ...", "expiresInSeconds": 900,
+  "refreshToken": "F3n...", "refreshExpiresInSeconds": 2592000 }
+```
+
+The access token is down to **15 minutes**, because the session's real length
+is now the refresh token's 30 days — and unlike the access token, that one
+lives in a database row and *can* be taken away.
+
+**The refresh token is opaque, not a JWT.** A credential that must be
+revocable gains nothing from being self-describing: you have to look it up to
+know whether it is still good, and once you are looking it up, the signature
+was never doing any work. It is 256 bits of `SecureRandom`, base64url.
+
+**Only its SHA-256 is stored.** A dump of `refresh_tokens` must not be a dump
+of live sessions. SHA-256 rather than bcrypt, for two reasons: bcrypt's work
+factor exists to slow brute force against guessable human passwords, and there
+is nothing to guess in 256 random bits — but the decisive one is that bcrypt
+salts every hash, and a salted hash cannot be *looked up*, only compared
+against one row at a time. The unsalted digest is what lets the presented
+token find its row in a single indexed hit.
+
+**Every exchange rotates.** `POST /api/v1/auth/refresh` consumes the token it
+was given and issues a new one in the same **family** — the set of tokens
+descended from one login.
+
+```
+login ──▶ token A ──refresh──▶ token B ──refresh──▶ token C      (one family)
+                     A spent              B spent
+```
+
+That is the part that turns a stolen token from undetectable into
+self-announcing. An honest client can only ever use a given refresh token
+once, because it replaced it the first time. So a **second** use means two
+parties hold the same token, and one of them stole it. Which one is calling
+right now is unknowable — the thief may be racing ahead of the victim, or
+replaying behind them — so the only safe answer is to distrust the whole
+family and make everyone log in again:
+
+```
+attacker steals token A, client refreshes first ──▶ B issued, A spent
+attacker presents A            ──▶ 401, and the entire family is revoked
+client later presents B        ──▶ 401 as well
+```
+
+Both are locked out, which is the intended outcome. Compare the alternative
+it replaces: without rotation, a stolen refresh token is a silent, renewable,
+permanent session and nothing ever reveals it.
+
+**The detection is not an `if`.** There is no "has this been used?" read
+anywhere in `refresh`, on purpose — that would be check-then-act, and two
+requests presenting the same token would both read *no* and both proceed. It
+is a conditional UPDATE, the same division of labour as account-service's
+ledger constraint:
+
+```sql
+UPDATE refresh_tokens SET used_at = :now
+ WHERE id = :id AND used_at IS NULL AND revoked_at IS NULL
+```
+
+Zero rows updated means somebody else already consumed it. The database is
+the only participant that can arbitrate a race the caller is part of.
+
+**Revocation has to outlive the failure that triggers it.** `refresh` is
+`@Transactional` and the reuse path ends by throwing, so a revocation
+enlisted in that same transaction would be rolled back along with it — the
+compromised family left live, and the attack unrecorded. It runs in a
+`REQUIRES_NEW` transaction instead, so it commits on its own. This is the kind
+of bug that only appears in production, months later, as "we log these and
+they never seem to take effect."
+
+**Expired is not the same as reused.** An expired token is the mechanism
+working, so it is rejected without touching the family. Coming back after a
+month away must not look identical to a theft.
+
+**What it costs, stated plainly.** A client that fires two refreshes
+concurrently with the same token trips this and gets logged out, with nothing
+stolen. Real deployments often soften that with a short grace window in which
+the immediately-preceding token is accepted once more. That is a deliberate
+trade of security for convenience and this project takes the strict side: a
+false logout costs a login, a missed detection costs the account.
+
+**`POST /api/v1/auth/logout`** revokes the family and returns `204` whether or
+not the token was recognised — an endpoint that answered "unknown token" would
+be an oracle for confirming which guesses are real. It is idempotent for the
+same reason the account lifecycle endpoints are: it asks for a state, not a
+change. Each login starts its own family, so signing out of a laptop leaves
+the phone signed in.
+
+**Service tokens get no refresh token at all** (the field is absent from the
+JSON, not null). A service holds its own client-id/secret and can ask for
+another token whenever it likes, so a second long-lived credential to store
+and rotate would add risk and buy nothing.
+
+Rotation writes a row per refresh, so `RefreshTokenCleanup` deletes rows a
+week past expiry on a schedule — a table that grows with *traffic* rather
+than with users is fine for a year and then is not. The week of retention is
+deliberate: a token deleted the instant it expires comes back as *unknown*,
+indistinguishable from one that never existed, which is a worse story in the
+logs when someone is investigating.
+
 ## Paginating the lists (all three services)
 
 Every list endpoint a user can reach returns a page, never a bare array (the
@@ -730,6 +861,15 @@ repository to *throw* the constraint violation, so it proves the catch block
 handles one correctly while saying nothing about whether the database ever
 raises it. That's the whole category these tests exist for.
 
+The fourth was the cheapest of all to find and the easiest to have shipped:
+the `refresh_tokens` migration declared `token_hash` as `CHAR(64)` while the
+entity maps a `String`, which Hibernate expects as `varchar`. Eighteen unit
+tests passed - they mock the repository, so no schema is involved at any
+point - and auth-service then refused to start, because `ddl-auto: validate`
+compares the mapping against the real columns. A migration and the entity it
+backs are two descriptions of one table, and nothing but a database will tell
+you they disagree.
+
 - `account-service`: `AccountIT` - fires N concurrent credit requests at the
   same account, both with the same Idempotency-Key (must post exactly once)
   and with distinct keys (all must apply, none lost to a lost update). It
@@ -750,6 +890,10 @@ raises it. That's the whole category these tests exist for.
   proves a real RS256 token is produced, let alone that the published key
   verifies it). Also covers concurrent registration of the same address, and
   that the service-client credentials in `application.yml` actually bind.
+  Refresh-token family revocation lives here too: the unit test can only
+  assert that `revokeFamily` was *called*, while whether that UPDATE really
+  reaches the perfectly valid token handed out one call earlier is a claim
+  about SQL, and only a database settles it.
 
 These are `*IT.java` classes run by `maven-failsafe-plugin`, gated behind an
 `integration-tests` Maven profile that's off by default. `verify` runs before
@@ -844,9 +988,16 @@ parts:
   a read model fed by the existing events or a query service that fans out
   and merges - a real design decision, not a missing endpoint, so it isn't
   faked here with something that only works while the data is small.
-- **No refresh tokens or revocation.** A leaked token is valid until it
-  expires (1 hour for a user token, 12 for a service token) - there's no way
-  to invalidate one early short of restarting auth-service, which invalidates
-  every outstanding token, not just the one you wanted to revoke.
+- **Nothing consumes the refresh-token reuse warning either.** Detecting
+  reuse revokes the family and writes a WARN line naming it, which is the
+  right thing to have happened - but somebody stealing sessions is exactly
+  the event a human should hear about, and this is the same missing last mile
+  as the stuck-transfer counter above.
+- **An access token still can't be revoked mid-life.** That is inherent to
+  validating it offline against the JWK set, and refresh tokens narrow it
+  rather than close it: revoking a family stops the session from continuing,
+  but an access token already issued stays valid for up to its 15 minutes.
+  Closing that properly means introspection or a shared denylist, and both
+  trade away the offline validation that makes the current design fast.
 - **auth-service's signing key doesn't survive a restart** - see
   "Authentication" above. Fine for a demo, not for anything real.
