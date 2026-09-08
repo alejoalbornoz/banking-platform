@@ -30,6 +30,7 @@ import java.security.SecureRandom;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.function.Consumer;
 
 @Service
 public class AccountService implements IAccountService {
@@ -150,6 +151,48 @@ public class AccountService implements IAccountService {
         Account account = findAccountOrThrow(accountId);
         return ledgerMapper.toLedgerResponse(
                 account, ledgerEntryRepository.findAllByAccountIdOrderByCreatedAtDesc(accountId));
+    }
+
+    @Override
+    public AccountResponse freeze(UUID accountId) {
+        return changeStatus(accountId, Account::freeze);
+    }
+
+    @Override
+    public AccountResponse reactivate(UUID accountId) {
+        return changeStatus(accountId, Account::reactivate);
+    }
+
+    @Override
+    public AccountResponse close(UUID accountId) {
+        return changeStatus(accountId, Account::close);
+    }
+
+    /**
+     * No ledger entry and no idempotency key, unlike credit/debit: a status
+     * change moves no money, so there is nothing for the ledger to explain,
+     * and repeating one is harmless because it asks for a state rather than
+     * for a delta.
+     * <p>
+     * It still contends on {@code @Version} like any other write, so it goes
+     * through the same retry template - each attempt re-reads the account so
+     * it decides against current state, and an exhausted budget surfaces as
+     * a 409 for the caller to retry rather than as a 500.
+     */
+    private AccountResponse changeStatus(UUID accountId, Consumer<Account> transition) {
+        RetryCallback<AccountResponse, RuntimeException> attempt = context ->
+                transactionTemplate.execute(status -> {
+                    Account account = findAccountOrThrow(accountId);
+                    transition.accept(account);
+                    return accountMapper.toResponse(accountRepository.save(account));
+                });
+
+        try {
+            return optimisticLockRetryTemplate.execute(attempt);
+        } catch (ObjectOptimisticLockingFailureException ex) {
+            throw new ConcurrentUpdateException(
+                    "Account " + accountId + " was modified concurrently too many times; please retry the request");
+        }
     }
 
     @Override

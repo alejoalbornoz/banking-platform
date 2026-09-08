@@ -48,6 +48,12 @@ public class SecurityConfig {
                         .requestMatchers("/v3/api-docs/**", "/swagger-ui/**", "/swagger-ui.html").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/v1/accounts/*/credit", "/api/v1/accounts/*/debit")
                         .hasRole("SERVICE")
+                        // Freezing is done *about* an account holder, not by
+                        // them - an owner who can lift their own freeze isn't
+                        // frozen. Closing is the holder's own call, so it's
+                        // authorized by ownership in the controller instead.
+                        .requestMatchers(HttpMethod.POST, "/api/v1/accounts/*/freeze", "/api/v1/accounts/*/reactivate")
+                        .hasRole("SERVICE")
                         .anyRequest().authenticated())
                 .oauth2ResourceServer(oauth2 -> oauth2.jwt(jwt -> jwt.jwtAuthenticationConverter(jwtAuthenticationConverter())))
                 .build();

@@ -52,4 +52,25 @@ public interface IAccountService {
      * can see that the stored balance and the ledger agree.
      */
     LedgerResponse getLedger(UUID accountId);
+
+    /**
+     * Blocks outgoing transfers while still accepting incoming ones. Safe to
+     * repeat - unlike credit/debit, asking for a state the account is
+     * already in changes nothing, so these three need no idempotency key.
+     *
+     * @throws com.portfolio.banking.account.exception.ConflictException if the account is closed
+     */
+    AccountResponse freeze(UUID accountId);
+
+    /**
+     * @throws com.portfolio.banking.account.exception.ConflictException if the account is closed
+     */
+    AccountResponse reactivate(UUID accountId);
+
+    /**
+     * Final: a closed account can't be reopened, debited, or credited.
+     *
+     * @throws com.portfolio.banking.account.exception.ConflictException if the balance isn't zero
+     */
+    AccountResponse close(UUID accountId);
 }

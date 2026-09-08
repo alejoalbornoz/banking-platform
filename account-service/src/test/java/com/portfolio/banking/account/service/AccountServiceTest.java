@@ -4,6 +4,7 @@ import com.portfolio.banking.account.dto.AccountResponse;
 import com.portfolio.banking.account.dto.CreateAccountRequest;
 import com.portfolio.banking.account.dto.LedgerResponse;
 import com.portfolio.banking.account.exception.ConcurrentUpdateException;
+import com.portfolio.banking.account.exception.ConflictException;
 import com.portfolio.banking.account.exception.InsufficientFundsException;
 import com.portfolio.banking.account.exception.OperationKeyReusedException;
 import com.portfolio.banking.account.exception.ResourceNotFoundException;
@@ -355,5 +356,87 @@ class AccountServiceTest {
 
         assertThat(ledger.computedBalance()).isEqualByComparingTo("30.00");
         assertThat(ledger.reconciled()).isTrue();
+    }
+
+    @Test
+    void freeze_blocksDebitsButStillAllowsCredits() {
+        Account account = accountWith("100.00");
+        when(accountRepository.findById(accountId)).thenReturn(Optional.of(account));
+        when(accountRepository.save(any(Account.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        AccountResponse response = accountService.freeze(accountId);
+
+        assertThat(response.status()).isEqualTo("FROZEN");
+        // The point of freezing: money can still arrive (a refund, an
+        // incoming transfer), it just can't leave.
+        assertThatThrownBy(() -> account.debit(new BigDecimal("10.00")))
+                .isInstanceOf(ConflictException.class);
+        account.credit(new BigDecimal("10.00"));
+        assertThat(account.getBalance()).isEqualByComparingTo("110.00");
+    }
+
+    @Test
+    void freeze_isRepeatable() {
+        Account account = accountWith("100.00");
+        account.freeze();
+        when(accountRepository.findById(accountId)).thenReturn(Optional.of(account));
+        when(accountRepository.save(any(Account.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        // Asks for a state rather than for a change, so repeating it is not
+        // an error - which is why these endpoints need no idempotency key.
+        assertThat(accountService.freeze(accountId).status()).isEqualTo("FROZEN");
+    }
+
+    @Test
+    void reactivate_restoresAFrozenAccount() {
+        Account account = accountWith("100.00");
+        account.freeze();
+        when(accountRepository.findById(accountId)).thenReturn(Optional.of(account));
+        when(accountRepository.save(any(Account.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        assertThat(accountService.reactivate(accountId).status()).isEqualTo("ACTIVE");
+    }
+
+    @Test
+    void close_requiresAZeroBalance() {
+        when(accountRepository.findById(accountId)).thenReturn(Optional.of(accountWith("0.01")));
+
+        // Money in a closed account would be stranded: it can be neither
+        // debited nor credited afterwards.
+        assertThatThrownBy(() -> accountService.close(accountId))
+                .isInstanceOf(ConflictException.class)
+                .hasMessageContaining("non-zero balance");
+    }
+
+    @Test
+    void close_onAnEmptyAccount_succeeds() {
+        when(accountRepository.findById(accountId)).thenReturn(Optional.of(accountWith("0.00")));
+        when(accountRepository.save(any(Account.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        assertThat(accountService.close(accountId).status()).isEqualTo("CLOSED");
+    }
+
+    @Test
+    void reactivate_onAClosedAccount_isRefusedBecauseClosingIsFinal() {
+        Account closed = accountWith("0.00");
+        closed.close();
+        when(accountRepository.findById(accountId)).thenReturn(Optional.of(closed));
+
+        // Without this guard, closing an account could be silently undone -
+        // through a method whose name suggests nothing of the sort.
+        assertThatThrownBy(() -> accountService.reactivate(accountId))
+                .isInstanceOf(ConflictException.class)
+                .hasMessageContaining("closing is final");
+    }
+
+    @Test
+    void freeze_onAClosedAccount_isRefused() {
+        Account closed = accountWith("0.00");
+        closed.close();
+        when(accountRepository.findById(accountId)).thenReturn(Optional.of(closed));
+
+        assertThatThrownBy(() -> accountService.freeze(accountId))
+                .isInstanceOf(ConflictException.class)
+                .hasMessageContaining("closing is final");
     }
 }

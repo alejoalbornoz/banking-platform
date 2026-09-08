@@ -117,19 +117,46 @@ public class Account {
         }
     }
 
+    /**
+     * Blocks outgoing money while still accepting incoming - see
+     * {@link #credit} and {@link #debit}. Freezing an already-frozen account
+     * is a no-op rather than an error: the caller asked for a state, and
+     * that state already holds.
+     */
     public void freeze() {
+        requireNotClosed("freeze");
         this.status = AccountStatus.FROZEN;
     }
 
     public void reactivate() {
+        requireNotClosed("reactivate");
         this.status = AccountStatus.ACTIVE;
     }
 
+    /**
+     * Requires a zero balance: closing an account that still holds money
+     * would strand it, since a closed account can be neither debited nor
+     * credited afterwards.
+     */
     public void close() {
         if (this.balance.signum() != 0) {
             throw new ConflictException("Cannot close account " + accountNumber + " with a non-zero balance: " + balance);
         }
         this.status = AccountStatus.CLOSED;
+    }
+
+    /**
+     * CLOSED is terminal. Without this, reactivating a closed account would
+     * silently undo a deliberate, final decision - and it would do so
+     * through a method whose name suggests nothing of the sort. The rule
+     * lives here rather than in a service because it is a property of the
+     * account itself, in the same way "balance never goes negative" is.
+     */
+    private void requireNotClosed(String operation) {
+        if (status == AccountStatus.CLOSED) {
+            throw new ConflictException(
+                    "Cannot " + operation + " a closed account: " + accountNumber + " (closing is final)");
+        }
     }
 
     public UUID getId() {

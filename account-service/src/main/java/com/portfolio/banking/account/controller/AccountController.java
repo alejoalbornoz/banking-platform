@@ -87,6 +87,41 @@ public class AccountController {
         return accountService.debit(accountId, idempotencyKey, request.amount());
     }
 
+    /**
+     * Freezing and reactivating are restricted to {@code ROLE_SERVICE} in
+     * {@code SecurityConfig}, not to the account's owner - and that asymmetry
+     * with {@code /close} below is the point. A freeze is a compliance or
+     * operations action taken <em>about</em> someone; letting the account
+     * holder lift their own freeze would defeat the entire reason for
+     * applying one.
+     * <p>
+     * Neither takes an {@code Idempotency-Key}, unlike credit and debit:
+     * these ask for a state rather than for a change, so repeating one lands
+     * in the same place.
+     */
+    @PostMapping("/{accountId}/freeze")
+    public AccountResponse freeze(@PathVariable UUID accountId) {
+        return accountService.freeze(accountId);
+    }
+
+    @PostMapping("/{accountId}/reactivate")
+    public AccountResponse reactivate(@PathVariable UUID accountId) {
+        return accountService.reactivate(accountId);
+    }
+
+    /**
+     * Closing, by contrast, is the holder's own decision about their own
+     * account, so it's authorized by ownership like the reads above. It's
+     * also final and refuses a non-zero balance - money in a closed account
+     * would be stranded, since it can be neither debited nor credited
+     * afterwards.
+     */
+    @PostMapping("/{accountId}/close")
+    public AccountResponse close(@AuthenticationPrincipal Jwt caller, @PathVariable UUID accountId) {
+        assertOwnerOrService(caller, accountService.getAccount(accountId).ownerId());
+        return accountService.close(accountId);
+    }
+
     /** The account's statement, with a recomputed balance to prove it reconciles. */
     @GetMapping("/{accountId}/ledger")
     public LedgerResponse getLedger(@AuthenticationPrincipal Jwt caller, @PathVariable UUID accountId) {

@@ -135,12 +135,38 @@ curl localhost:8080/api/v1/accounts -H "Authorization: Bearer {token}"
 
 # Read the statement, with the balance recomputed from the entries
 curl localhost:8080/api/v1/accounts/{id}/ledger -H "Authorization: Bearer {token}"
+
+# Close your own account. Refused with a non-zero balance.
+curl -X POST localhost:8080/api/v1/accounts/{id}/close -H "Authorization: Bearer {token}"
 ```
 
 `POST /credit` and `/debit` still exist, but they're `ROLE_SERVICE`-only now -
 calling them with a user token gets a 403. Move money via a transfer instead;
 see "Authentication" below for why crediting an account you don't own can
 never pass an ownership check, and how transaction-service gets around it.
+
+#### The account lifecycle
+
+`ACTIVE → FROZEN` and back, and `→ CLOSED` once, from either. What each state
+means is enforced on the account itself rather than by its callers: a frozen
+account still *receives* money and simply can't send it, and a closed one does
+neither.
+
+**Who may do which is deliberately asymmetric.** Freezing and reactivating
+(`POST /{id}/freeze`, `/{id}/reactivate`) require `ROLE_SERVICE`, because a
+freeze is a compliance or operations action taken *about* an account holder -
+one who could lift their own freeze isn't frozen. Closing (`POST /{id}/close`)
+is the holder's own decision about their own account, so it's authorized by
+ownership like the reads.
+
+**Closing is final**, and refuses a non-zero balance: money in a closed
+account would be stranded, since it can be neither debited nor credited
+afterwards. Reactivating a closed account is refused rather than silently
+undoing a deliberate, terminal decision.
+
+None of the three takes an `Idempotency-Key`, unlike credit and debit. They
+ask for a *state* rather than for a change, so repeating one lands in the same
+place - there is no second application to guard against.
 
 ### transaction-service
 
