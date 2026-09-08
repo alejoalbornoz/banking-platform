@@ -8,6 +8,46 @@ concurrency control, idempotent operations, event-driven communication over
 RabbitMQ, distributed tracing, and interface-driven, test-covered service
 design.
 
+```mermaid
+flowchart LR
+    client([client]) --> gw["api-gateway<br/>:8080"]
+
+    gw --> auth["auth-service :8084<br/>auth_db"]
+    gw --> acct["account-service :8081<br/>account_db"]
+    gw --> tx["transaction-service :8082<br/>transaction_db"]
+    gw --> notif["notification-service :8083<br/>notification_db"]
+
+    tx -->|"debit + credit"| acct
+    notif -->|"who owns this account?"| acct
+
+    acct -.->|"account.created"| mq{{"RabbitMQ<br/>banking.events"}}
+    tx -.->|"transfer.completed<br/>transfer.failed"| mq
+    mq -.-> notif
+```
+
+Solid arrows are synchronous HTTP, dashed ones are events. Each service owns
+its own database and never reaches into another's. The two synchronous
+service-to-service calls both carry a service credential rather than a user's
+token, for reasons the [Authentication](#authentication-auth-service-api-gateway)
+section gets into. Not drawn, to keep the picture readable: all three
+services on the right validate tokens against auth-service's published JWK
+set, and Zipkin collects traces from every one of them.
+
+**The parts worth reading**, if you're here to see how something was
+approached rather than to run it:
+
+| | |
+|---|---|
+| [Concurrency](#how-concurrency-is-handled-account-service) | Optimistic locking, and retrying against current state instead of resubmitting a stale write |
+| [The ledger](#the-ledger-and-why-creditdebit-are-idempotent) | Why a unique constraint - not a lookup - is what makes credit and debit idempotent, and which of two similar-looking hazards each one actually solves |
+| [The transfer saga](#how-a-transfer-works-transaction-service) | Two accounts, two services, no distributed transaction: compensation, crash recovery, and why the saga is deliberately not one big `@Transactional` |
+| [Money that gets stuck](#when-the-compensation-itself-fails) | The one outcome nothing can fix automatically, and what it takes for that to reach a human |
+| [The outbox pattern](#reliable-events-the-outbox-pattern-transaction-service) | Committing and publishing are two systems; crash between them and they disagree forever |
+| [Idempotent consumption](#consuming-idempotently-and-dead-lettering-what-cant-be-handled-notification-service) | The same constraint trick on the consumer side, plus dead-lettering what can never be processed |
+| [Authentication](#authentication-auth-service-api-gateway) | RS256 and a published JWK set, and why crediting a transfer's destination can never pass an ownership check |
+| [Integration tests](#integration-tests) | Three bugs that unit tests couldn't have caught, and exactly why each one was invisible |
+| [Known gaps](#known-gaps) | What isn't solved, and which of those were deliberate |
+
 ## Stack
 
 - Java 21, Spring Boot 3.3
@@ -24,15 +64,15 @@ design.
 - Entities live in `model` (not `domain`).
 - Each service owns its exceptions and DTOs under its own `exception`/`dto` packages. `common` is intentionally minimal: it only holds event payload contracts (`AccountCreatedEvent`, `TransferCompletedEvent`, `TransferFailedEvent`, `DomainEvent`), since those genuinely must be identical between a publisher and its consumers. Everything else is duplicated per service on purpose, to keep each service independently deployable and readable on its own.
 
-## Services (roadmap)
+## Services
 
-| Service | Port | Status | Responsibility |
+| Service | Port | Database | Responsibility |
 |---|---|---|---|
-| `account-service` | 8081 | ✅ built | Accounts, balances. Source of truth for how much money exists. |
-| `transaction-service` | 8082 | ✅ built | Transfers between accounts: idempotency keys, saga + compensation, outbox pattern |
-| `notification-service` | 8083 | ✅ built | Consumes account/transfer events off RabbitMQ, idempotently records notifications |
-| `auth-service` | 8084 | ✅ built | User registration/login, JWT issuance, JWKS publishing |
-| `api-gateway` | 8080 | ✅ built | Single entry point, path-based routing |
+| `api-gateway` | 8080 | - | Single entry point, path-based routing, aggregated Swagger UI |
+| `account-service` | 8081 | `account_db` | Accounts, balances, ledger. Source of truth for how much money exists. |
+| `transaction-service` | 8082 | `transaction_db` | Transfers between accounts: idempotency keys, saga + compensation, outbox pattern |
+| `notification-service` | 8083 | `notification_db` | Consumes account/transfer events off RabbitMQ, idempotently records notifications |
+| `auth-service` | 8084 | `auth_db` | User registration/login, JWT issuance, JWKS publishing |
 
 ## Running the whole thing
 
@@ -293,16 +333,55 @@ rejected with `400 CURRENCY_MISMATCH` before a transaction row is ever
 created - unlike insufficient funds, which is a saga *outcome* since the
 balance it depends on can genuinely change between attempts.
 
+Here is the whole happy path, end to end. Note how the database writes and
+the HTTP calls interleave rather than nest - that's the third point below,
+and it's the shape of the diagram itself:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as client
+    participant T as transaction-service
+    participant DB as transaction_db
+    participant A as account-service
+    participant Q as RabbitMQ
+    participant N as notification-service
+
+    C->>T: POST /transfers + Idempotency-Key
+    T->>A: read source and destination
+    Note over T,A: owner and currency checked here,<br/>before a transaction row exists
+    T->>DB: insert PENDING
+    T->>A: debit source
+    T->>DB: status = DEBITED
+    T->>A: credit destination
+    T->>DB: status = COMPLETED + outbox row,<br/>in one transaction
+    T-->>C: 201 Created
+    DB->>Q: OutboxRelay publishes transfer.completed
+    Q->>N: deliver (at least once)
+    N->>N: dedup on eventId, record both sides
 ```
-PENDING ──debit ok──> DEBITED ──credit ok──> COMPLETED
-   │                     │
-   │ debit failed        │ credit failed → credit source back
-   ↓                     ↓                        │
- FAILED                FAILED <──────────ok───────┤
- (nothing moved)    (compensated)                 │
-                                                  ↓ compensation also failed
-                                        COMPENSATION_FAILED
-                                        (money stuck - needs ops)
+
+Every branch that path can take, including the one it can't recover from:
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> PENDING
+    PENDING --> DEBITED: debit ok
+    PENDING --> FAILED: debit failed
+    DEBITED --> COMPLETED: credit ok
+    DEBITED --> FAILED: credit failed, source credited back
+    DEBITED --> COMPENSATION_FAILED: credit failed, and so did crediting back
+
+    note right of FAILED
+        Terminal. Either nothing ever moved,
+        or it moved and was undone.
+    end note
+
+    note right of COMPENSATION_FAILED
+        Money left an account and reached nobody.
+        No retry fixes this one - a human has to.
+    end note
 ```
 
 Three things make this safe:
