@@ -30,6 +30,52 @@ spring:
           predicates:
             - Path=/api/v1/notifications/**
 
+        # These four exist only so the aggregated Swagger UI below can fetch
+        # each service's document from this same origin. Without them the
+        # browser would have to reach four different ports, which is both a
+        # cross-origin problem and the opposite of what a gateway is for.
+        - id: auth-service-docs
+          uri: http://${AUTH_SERVICE_HOST:localhost}:8084
+          predicates:
+            - Path=/docs/auth-service/v3/api-docs
+          filters:
+            - RewritePath=/docs/auth-service/v3/api-docs, /v3/api-docs
+        - id: account-service-docs
+          uri: http://${ACCOUNT_SERVICE_HOST:localhost}:8081
+          predicates:
+            - Path=/docs/account-service/v3/api-docs
+          filters:
+            - RewritePath=/docs/account-service/v3/api-docs, /v3/api-docs
+        - id: transaction-service-docs
+          uri: http://${TRANSACTION_SERVICE_HOST:localhost}:8082
+          predicates:
+            - Path=/docs/transaction-service/v3/api-docs
+          filters:
+            - RewritePath=/docs/transaction-service/v3/api-docs, /v3/api-docs
+        - id: notification-service-docs
+          uri: http://${NOTIFICATION_SERVICE_HOST:localhost}:8083
+          predicates:
+            - Path=/docs/notification-service/v3/api-docs
+          filters:
+            - RewritePath=/docs/notification-service/v3/api-docs, /v3/api-docs
+
+# One Swagger UI at http://localhost:8080/swagger-ui.html, with a dropdown
+# for the four services - the same "one door in" the gateway already provides
+# for traffic. Start with auth-service in the dropdown (springdoc sorts the
+# list alphabetically, so it isn't first): the token from its /login is what
+# the other three services' Authorize buttons expect.
+springdoc:
+  swagger-ui:
+    urls:
+      - name: auth-service
+        url: /docs/auth-service/v3/api-docs
+      - name: account-service
+        url: /docs/account-service/v3/api-docs
+      - name: transaction-service
+        url: /docs/transaction-service/v3/api-docs
+      - name: notification-service
+        url: /docs/notification-service/v3/api-docs
+
 management:
   endpoints:
     web:

@@ -31,6 +31,10 @@ public class SecurityConfig {
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers("/actuator/**").permitAll()
+                        // The API's shape is not a secret - what it guards
+                        // is the data behind it, and every endpoint the
+                        // document describes still demands a token.
+                        .requestMatchers("/v3/api-docs/**", "/swagger-ui/**", "/swagger-ui.html").permitAll()
                         // The ops view of stuck transfers spans every user's
                         // transfers, so ownership can't authorize it - only a
                         // holder of the internal service credential may read it.

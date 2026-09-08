@@ -41,6 +41,11 @@ public class SecurityConfig {
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers("/actuator/**").permitAll()
+                        // The API's shape is not a secret - what it guards is
+                        // the data behind it. An unreachable API document
+                        // helps nobody, and every endpoint it describes still
+                        // demands a token.
+                        .requestMatchers("/v3/api-docs/**", "/swagger-ui/**", "/swagger-ui.html").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/v1/accounts/*/credit", "/api/v1/accounts/*/debit")
                         .hasRole("SERVICE")
                         .anyRequest().authenticated())

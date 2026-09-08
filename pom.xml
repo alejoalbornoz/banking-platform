@@ -49,6 +49,9 @@
         <!-- Release train aligned with Boot 3.3.x, for api-gateway's
              spring-cloud-starter-gateway. -->
         <spring-cloud.version>2023.0.3</spring-cloud.version>
+        <!-- Third-party, so not covered by the Spring Boot BOM - the version
+             has to be pinned here ourselves. 2.x is the Boot 3 line. -->
+        <springdoc.version>2.6.0</springdoc.version>
     </properties>
 
     <dependencyManagement>

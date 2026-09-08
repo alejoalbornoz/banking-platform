@@ -42,6 +42,13 @@
             <artifactId>spring-boot-starter-amqp</artifactId>
         </dependency>
 
+        <!-- Serves this service's own OpenAPI document and Swagger UI. -->
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+            <version>${springdoc.version}</version>
+        </dependency>
+
         <!-- Validates JWTs issued by auth-service against its published
              JWK set - no secret ever shared between the two services. -->
         <dependency>

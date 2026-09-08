@@ -25,6 +25,16 @@
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
 
+        <!-- The webflux flavour, not webmvc: Spring Cloud Gateway is
+             reactive, and this module has no servlet stack to hang the
+             servlet variant off. Serves the one Swagger UI that aggregates
+             all four services' documents. -->
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webflux-ui</artifactId>
+            <version>${springdoc.version}</version>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>

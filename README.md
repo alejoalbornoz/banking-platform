@@ -45,7 +45,8 @@ and Zipkin. `--wait` returns once every container reports healthy, so when
 the command finishes the platform is actually ready to take requests - go
 straight to "Trying the API" below, on port 8080.
 
-- API gateway on `8080` - the only port a client needs
+- API gateway on `8080` - the only port a client needs, and where the
+  Swagger UI for all four services lives (http://localhost:8080/swagger-ui.html)
 - Postgres on `5432` (databases `account_db`, `transaction_db`,
   `notification_db`, `auth_db` are pre-created)
 - RabbitMQ on `5672` (management UI at http://localhost:15672, `banking`/`banking`)
@@ -86,9 +87,20 @@ fetch its public key set the first time they validate a token.
 
 ## Trying the API
 
-Everything below goes through the gateway on port 8080, and (`auth-service`'s
-own endpoints aside) needs an `Authorization: Bearer <token>` header from
-here on - every other service now validates it.
+**http://localhost:8080/swagger-ui.html** is the quickest way in: one Swagger
+UI with a dropdown for all four services, served through the gateway so the
+browser only ever talks to one origin. Log in via auth-service's
+`POST /api/v1/auth/login`, paste the token into the Authorize button, and the
+other three services are callable from the page.
+
+Each service also serves its own document at `/v3/api-docs` on its own port,
+which is what the aggregated page fetches. Those paths are deliberately left
+open in each `SecurityConfig`: the shape of an API isn't the secret, the data
+behind it is, and every endpoint described there still demands a token.
+
+The curl walkthrough below covers the same ground. Everything goes through
+the gateway on port 8080, and (`auth-service`'s own endpoints aside) needs an
+`Authorization: Bearer <token>` header - every other service validates it.
 
 ### auth-service: register and log in
 
