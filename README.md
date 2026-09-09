@@ -46,8 +46,9 @@ approached rather than to run it:
 | [Idempotent consumption](#consuming-idempotently-and-dead-lettering-what-cant-be-handled-notification-service) | The same constraint trick on the consumer side, plus dead-lettering what can never be processed |
 | [Authentication](#authentication-auth-service-api-gateway) | RS256 and a published JWK set, and why crediting a transfer's destination can never pass an ownership check |
 | [Refresh tokens](#refresh-tokens-rotation-and-detecting-theft) | How rotation turns a stolen token from undetectable into self-announcing, and why the revocation needs its own transaction |
+| [Login throttling](#throttling-the-front-door-without-handing-out-a-new-attack) | Why lockout is a worse attack than the one it prevents, and how a throttle can accidentally become the user-enumeration oracle it sits next to |
 | [Pagination](#paginating-the-lists-all-three-services) | Why a cursor and not an offset, and the reconciliation check that paginating a statement quietly turns into a lie |
-| [Integration tests](#integration-tests) | Three bugs that unit tests couldn't have caught, and exactly why each one was invisible |
+| [Integration tests](#integration-tests) | Four bugs that unit tests couldn't have caught, and exactly why each one was invisible |
 | [Known gaps](#known-gaps) | What isn't solved, and which of those were deliberate |
 
 ## Stack
@@ -175,6 +176,12 @@ curl -X POST localhost:8080/api/v1/auth/logout \
 Try sending the *same* `refreshToken` to `/refresh` twice: the second call
 gets `401`, and so does the token the first call handed you - a replayed
 token is treated as a stolen one, and the whole family goes.
+
+And try getting a password wrong seven times in a row: the first six come
+back `401`, then it turns into `429` with a `Retry-After`, and the *correct*
+password gets 429 too until the delay elapses - nothing is checked while an
+address is held off. An address you never registered behaves identically, on
+purpose; see "Throttling the front door" below.
 
 ### account-service
 
@@ -738,6 +745,77 @@ JSON, not null). A service holds its own client-id/secret and can ask for
 another token whenever it likes, so a second long-lived credential to store
 and rotate would add risk and buy nothing.
 
+### Throttling the front door, without handing out a new attack
+
+All that care over tokens is worth very little if `/login` accepts unlimited
+guesses, which it did. Two separate problems, and the interesting part of each
+is what the obvious fix gets wrong.
+
+**Backoff, not lockout.** "Lock the account after five failures" trades one
+attack for a cheaper one: knowing somebody's email address becomes enough to
+keep *them* out of their own account, indefinitely, for free. So the delay
+doubles instead — 5 free attempts, then 2s, 4s, 8s, up to a 15-minute cap.
+Guessing is hopeless long before the numbers get large, a person who
+fat-fingers their password twice never learns this exists, and waiting is
+always enough to get back in.
+
+**The delay is derived, never stored.** There is no `locked_until` column and
+nothing to unlock. `failed_count` and `last_failure_at` are enough to say how
+long an address is held off *right now*, so the delay expires by itself. That
+sidesteps the classic failure mode of lockout tables — the row that never got
+unlocked because the job that was supposed to unlock it stopped running.
+
+**The throttle counts addresses, not accounts — and that is the whole point.**
+Counting only registered addresses would have made the throttle answer the
+exact question `InvalidCredentialsException` is so careful never to answer.
+"Five tries then a delay" versus "unlimited tries" is a perfectly good user
+-enumeration oracle, and it would have quietly undone the identical-error-
+message design sitting right next to it. An address nobody ever registered is
+throttled identically.
+
+**The counter is advanced by an upsert, not by reading it and writing it
+back.** Same reasoning as the ledger and as refresh-token consumption: a burst
+of simultaneous guesses would all read the same count before any of them
+wrote, and twenty attempts would be recorded as one — which is precisely the
+shape an attacker would use.
+
+```sql
+INSERT INTO login_attempts (email, failed_count, last_failure_at)
+VALUES (:email, 1, :now)
+ON CONFLICT (email) DO UPDATE
+   SET failed_count = CASE WHEN login_attempts.last_failure_at < :resetBefore
+                           THEN 1 ELSE login_attempts.failed_count + 1 END,
+       last_failure_at = :now
+```
+
+The `CASE` is the decay, in the same statement so that resetting is atomic
+too. And recording a failure runs in its own `REQUIRES_NEW` transaction,
+because `login` is `@Transactional` and a failed login ends by throwing — a
+counter that rolls back every time it counts something is not a counter. That
+is the same trap as the refresh-token revocation above, and it is worth
+noticing that it appeared twice in one service.
+
+**The other hole was on the clock.** `login` already returned one
+indistinguishable error for "no such address" and "wrong password". But an
+unknown address returned *before any hashing at all*, while a known one
+returned after a full bcrypt — about 100ms apart. That gap is a usable
+user-enumeration oracle that needs no repeated attempts and no throttle to
+evade, just a stopwatch. An unknown address is now compared against a decoy
+hash it cannot match, so both paths cost the same. The decoy is generated at
+startup from the configured encoder rather than hardcoded, since a decoy
+produced by a different algorithm than the real hashes would take a different
+amount of time and give the game away.
+
+`AuthServiceTest` asserts the two paths stay within the same order of
+magnitude of each other rather than pinning absolute numbers, since bcrypt's
+cost depends on the machine.
+
+**What this deliberately does not cover:** an attack spread thinly across many
+addresses, or one address attacked from thousands of hosts. Both want a
+per-IP limit at the edge, which needs shared state at the gateway and a
+decision about how far to trust `X-Forwarded-For` — a header the client
+controls unless something upstream overwrites it. See "Known gaps".
+
 Rotation writes a row per refresh, so `RefreshTokenCleanup` deletes rows a
 week past expiry on a schedule — a table that grows with *traffic* rather
 than with users is fine for a year and then is not. The week of retention is
@@ -988,6 +1066,16 @@ parts:
   a read model fed by the existing events or a query service that fans out
   and merges - a real design decision, not a missing endpoint, so it isn't
   faked here with something that only works while the data is small.
+- **No per-IP rate limiting at the gateway.** The login throttle counts
+  failures per address, which stops someone working through passwords for one
+  account but not an attack spread thinly across many addresses, nor one
+  address hit from thousands of hosts. That wants a limit at the edge, which
+  needs shared state across gateway instances (Redis) and a decision about how
+  far to trust `X-Forwarded-For` - a header the client controls unless
+  something upstream overwrites it. Neither is a detail worth faking.
+- **`/register` is not throttled either.** It is unauthenticated and does a
+  bcrypt per call, so it is the same shape of problem; the same counter would
+  cover it, keyed the same way.
 - **Nothing consumes the refresh-token reuse warning either.** Detecting
   reuse revokes the family and writes a WARN line naming it, which is the
   right thing to have happened - but somebody stealing sessions is exactly

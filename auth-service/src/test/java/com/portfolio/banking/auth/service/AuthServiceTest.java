@@ -9,6 +9,7 @@ import com.portfolio.banking.auth.dto.TokenResponse;
 import com.portfolio.banking.auth.dto.UserResponse;
 import com.portfolio.banking.auth.exception.EmailAlreadyExistsException;
 import com.portfolio.banking.auth.exception.InvalidCredentialsException;
+import com.portfolio.banking.auth.exception.TooManyLoginAttemptsException;
 import com.portfolio.banking.auth.model.RefreshToken;
 import com.portfolio.banking.auth.model.User;
 import com.portfolio.banking.auth.repository.IRefreshTokenRepository;
@@ -31,6 +32,7 @@ import org.springframework.transaction.TransactionStatus;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.HexFormat;
 import java.util.Map;
@@ -41,6 +43,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -65,6 +68,9 @@ class AuthServiceTest {
     @Mock
     private IRefreshTokenRepository refreshTokenRepository;
 
+    @Mock
+    private LoginThrottle loginThrottle;
+
     private final PasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
     private AuthService authService;
@@ -81,7 +87,7 @@ class AuthServiceTest {
         lenient().when(transactionManager.getTransaction(any())).thenReturn(mock(TransactionStatus.class));
 
         authService = new AuthService(
-                userRepository, refreshTokenRepository, passwordEncoder, jwtEncoder,
+                userRepository, refreshTokenRepository, loginThrottle, passwordEncoder, jwtEncoder,
                 serviceClientsProperties, transactionManager,
                 USER_TOKEN_TTL_SECONDS, SERVICE_TOKEN_TTL_SECONDS, REFRESH_TOKEN_TTL_SECONDS);
     }
@@ -192,6 +198,88 @@ class AuthServiceTest {
         assertThatThrownBy(() -> authService.issueServiceToken(
                 new ServiceTokenRequest("unknown-client", "anything")))
                 .isInstanceOf(InvalidCredentialsException.class);
+    }
+
+    /**
+     * The throttle has to run before the user lookup, not after: its whole
+     * job is to make a rejected attempt cost the server nothing, and a bcrypt
+     * comparison is the entire cost of a login.
+     */
+    @Test
+    void login_whenThrottled_isRejectedWithoutTouchingTheDatabaseOrHashingAnything() {
+        doThrow(new TooManyLoginAttemptsException(Duration.ofSeconds(8)))
+                .when(loginThrottle).assertNotThrottled(eq("user@example.com"), any());
+
+        assertThatThrownBy(() -> authService.login(new LoginRequest("user@example.com", "whatever")))
+                .isInstanceOf(TooManyLoginAttemptsException.class);
+
+        verify(userRepository, never()).findByEmail(any());
+        verify(loginThrottle, never()).recordFailure(any(), any());
+    }
+
+    @Test
+    void login_wrongPassword_isCountedAgainstTheAddress() {
+        User user = userWithId(UUID.randomUUID(), "user@example.com", passwordEncoder.encode("correct-password"));
+        when(userRepository.findByEmail("user@example.com")).thenReturn(Optional.of(user));
+
+        assertThatThrownBy(() -> authService.login(new LoginRequest("user@example.com", "wrong-password")))
+                .isInstanceOf(InvalidCredentialsException.class);
+
+        verify(loginThrottle).recordFailure(eq("user@example.com"), any());
+        verify(loginThrottle, never()).recordSuccess(any());
+    }
+
+    /**
+     * The counter is keyed on the address that was submitted, registered or
+     * not. Skipping the count for unknown addresses would make the throttle
+     * itself say which addresses exist - five tries then a delay, versus
+     * unlimited tries, is a perfectly good user-enumeration oracle, and it
+     * would undo the care taken over returning one indistinguishable error.
+     */
+    @Test
+    void login_unknownAddress_isCountedExactlyLikeARealOne() {
+        when(userRepository.findByEmail("nobody@example.com")).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> authService.login(new LoginRequest("nobody@example.com", "whatever")))
+                .isInstanceOf(InvalidCredentialsException.class);
+
+        verify(loginThrottle).recordFailure(eq("nobody@example.com"), any());
+    }
+
+    /**
+     * Returning the same exception for "no such address" and "wrong password"
+     * only hides which happened if the two also take the same time. Before the
+     * decoy hash, an unknown address returned before any hashing at all and a
+     * known one after a full bcrypt - a gap big enough to read a user list out
+     * of, with a stopwatch and no repeated attempts.
+     * <p>
+     * The ratio, not the absolute numbers, is what this asserts: bcrypt's cost
+     * varies with the machine, but the two paths have to stay in the same
+     * order of magnitude as each other.
+     */
+    @Test
+    void login_unknownAddressAndWrongPassword_takeComparableTime() {
+        User user = userWithId(UUID.randomUUID(), "known@example.com", passwordEncoder.encode("correct-password"));
+        when(userRepository.findByEmail("known@example.com")).thenReturn(Optional.of(user));
+        when(userRepository.findByEmail("unknown@example.com")).thenReturn(Optional.empty());
+
+        // One warm-up of each, so JIT compilation lands on neither side.
+        timeFailedLogin("known@example.com");
+        timeFailedLogin("unknown@example.com");
+
+        long known = timeFailedLogin("known@example.com");
+        long unknown = timeFailedLogin("unknown@example.com");
+
+        assertThat((double) unknown / known)
+                .as("unknown address took %d ns, known took %d ns", unknown, known)
+                .isBetween(0.25, 4.0);
+    }
+
+    private long timeFailedLogin(String email) {
+        long start = System.nanoTime();
+        assertThatThrownBy(() -> authService.login(new LoginRequest(email, "wrong-password")))
+                .isInstanceOf(InvalidCredentialsException.class);
+        return System.nanoTime() - start;
     }
 
     @Test

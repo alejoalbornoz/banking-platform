@@ -51,6 +51,22 @@ banking:
     refresh-token-retention-after-expiry-seconds: 604800   # 7 days
     refresh-token-cleanup-interval-ms: 3600000             # hourly
   security:
+    # Throttling the front door. Backoff rather than lockout: a hard lock
+    # after N failures would let anyone keep a user out of their own account
+    # just by knowing their address. See LoginThrottle.
+    login-throttle:
+      # Failures allowed before any delay at all - a person mistyping their
+      # own password a few times should never notice this exists.
+      free-attempts: 5
+      # Then it doubles per failure: 2s, 4s, 8s, ... A dictionary attack is
+      # down to a handful of guesses an hour long before it has covered
+      # anything.
+      base-delay-seconds: 2
+      max-delay-seconds: 900       # 15 minutes
+      # Quiet for this long and the counter starts over, so yesterday's bad
+      # day never costs anyone anything today.
+      reset-after-seconds: 3600
+      cleanup-interval-ms: 3600000
     # Service-to-service credentials, not user accounts - deliberately kept
     # out of the `users` table. Real deployments would pull secrets like this
     # from a vault, not plain YAML; this is a portfolio project's version of

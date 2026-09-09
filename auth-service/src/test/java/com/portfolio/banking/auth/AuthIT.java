@@ -6,6 +6,8 @@ import com.portfolio.banking.auth.dto.RegisterRequest;
 import com.portfolio.banking.auth.dto.ServiceTokenRequest;
 import com.portfolio.banking.auth.dto.TokenResponse;
 import com.portfolio.banking.auth.dto.UserResponse;
+import com.portfolio.banking.auth.model.LoginAttempt;
+import com.portfolio.banking.auth.repository.ILoginAttemptRepository;
 import com.portfolio.banking.auth.repository.IRefreshTokenRepository;
 import com.portfolio.banking.auth.repository.IUserRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -15,6 +17,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
@@ -55,6 +58,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li><b>Configuration binding.</b> The unit test constructs
  *       {@code ServiceClientsProperties} by hand; only a real context proves
  *       the credentials in application.yml actually bind.</li>
+ *   <li><b>The login-attempt counter under concurrency.</b> It is advanced
+ *       by an {@code ON CONFLICT} upsert precisely because a burst of
+ *       simultaneous guesses must not all read the same count and write it
+ *       back as one. Only a real database can show that it does.</li>
  *   <li><b>Refresh token family revocation.</b> The unit test can assert
  *       that {@code revokeFamily} was called; whether that UPDATE really
  *       reaches every descendant of a login is a claim about SQL, and only a
@@ -82,6 +89,9 @@ class AuthIT {
 
     @Autowired
     private IRefreshTokenRepository refreshTokenRepository;
+
+    @Autowired
+    private ILoginAttemptRepository loginAttemptRepository;
 
     @Autowired
     private PasswordEncoder passwordEncoder;
@@ -324,6 +334,103 @@ class AuthIT {
                 .isNotEmpty()
                 .as("the token itself is never written down")
                 .noneMatch(stored -> stored.getTokenHash().equals(session.refreshToken()));
+    }
+
+    @Test
+    void login_repeatedFailures_eventuallyReturn429WithARetryAfterHeader() {
+        String email = uniqueEmail();
+        restTemplate.postForEntity("/api/v1/auth/register",
+                new RegisterRequest(email, "password123"), UserResponse.class);
+
+        // The free attempts, which must all still be plain 401s - somebody
+        // mistyping their own password a few times cannot meet this.
+        for (int i = 0; i < FREE_ATTEMPTS; i++) {
+            assertThat(failedLogin(email).getStatusCode())
+                    .as("attempt %d is still free", i + 1)
+                    .isEqualTo(HttpStatus.UNAUTHORIZED);
+        }
+        assertThat(failedLogin(email).getStatusCode())
+                .as("the attempt that trips it is still answered as a bad password")
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
+
+        ResponseEntity<String> throttled = failedLogin(email);
+        assertThat(throttled.getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+        assertThat(throttled.getBody()).contains("TOO_MANY_LOGIN_ATTEMPTS");
+        assertThat(throttled.getHeaders().getFirst(HttpHeaders.RETRY_AFTER))
+                .as("a 429 without Retry-After tells a client to back off but not for how long")
+                .isNotNull();
+
+        // And the correct password does not get you past it either - the
+        // whole point is that no password is checked at all while held off.
+        ResponseEntity<String> withRightPassword = restTemplate.postForEntity("/api/v1/auth/login",
+                new LoginRequest(email, "password123"), String.class);
+        assertThat(withRightPassword.getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+    }
+
+    /**
+     * The throttle must not become the user-enumeration oracle that the
+     * identical 401 exists to avoid. An address nobody registered has to be
+     * counted, and rejected, exactly like a real one.
+     */
+    @Test
+    void login_anAddressThatWasNeverRegistered_isThrottledIdentically() {
+        String neverRegistered = uniqueEmail();
+
+        for (int i = 0; i <= FREE_ATTEMPTS; i++) {
+            assertThat(failedLogin(neverRegistered).getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        }
+
+        assertThat(failedLogin(neverRegistered).getStatusCode())
+                .as("same treatment as a registered address, so the difference reveals nothing")
+                .isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+    }
+
+    /**
+     * The reason the counter is advanced by an {@code ON CONFLICT} upsert
+     * rather than by reading it and writing it back. A mocked repository can
+     * never show this: every attempt in a burst reads the same count before
+     * any of them writes, so a read-then-write implementation records twenty
+     * simultaneous guesses as one - which is precisely the shape an attacker
+     * would use.
+     */
+    @Test
+    void login_concurrentFailures_areAllCounted() throws Exception {
+        String email = uniqueEmail();
+        int attempts = 8;
+
+        fireConcurrently(attempts, () -> failedLogin(email));
+
+        assertThat(loginAttemptRepository.findById(email)).isPresent().get()
+                .extracting(LoginAttempt::getFailedCount)
+                .as("all %d attempts counted, not just the ones that happened to be spaced out", attempts)
+                .isEqualTo(attempts);
+    }
+
+    @Test
+    void login_success_clearsTheCounterSoAnEarlierBadRunCostsNothingLater() {
+        String email = uniqueEmail();
+        restTemplate.postForEntity("/api/v1/auth/register",
+                new RegisterRequest(email, "password123"), UserResponse.class);
+
+        failedLogin(email);
+        failedLogin(email);
+        assertThat(loginAttemptRepository.findById(email)).isPresent();
+
+        ResponseEntity<TokenResponse> ok = restTemplate.postForEntity("/api/v1/auth/login",
+                new LoginRequest(email, "password123"), TokenResponse.class);
+        assertThat(ok.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        assertThat(loginAttemptRepository.findById(email))
+                .as("remembering your password should not leave you serving out a delay")
+                .isEmpty();
+    }
+
+    /** Matches {@code banking.security.login-throttle.free-attempts} in application.yml. */
+    private static final int FREE_ATTEMPTS = 5;
+
+    private ResponseEntity<String> failedLogin(String email) {
+        return restTemplate.postForEntity("/api/v1/auth/login",
+                new LoginRequest(email, "definitely-not-the-password"), String.class);
     }
 
     private record Session(UUID userId, String refreshToken) {

@@ -4,6 +4,7 @@ import com.portfolio.banking.auth.dto.ErrorResponse;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -28,6 +29,22 @@ public class GlobalExceptionHandler {
         return build(HttpStatus.UNAUTHORIZED, ex.getErrorCode(), ex.getMessage(), request, List.of());
     }
 
+    /**
+     * The only handler here that adds a header, because a 429 without
+     * {@code Retry-After} tells a well-behaved client it should back off but
+     * not by how much, leaving it to poll and find out - which is the
+     * behaviour the status code exists to prevent.
+     */
+    @ExceptionHandler(TooManyLoginAttemptsException.class)
+    public ResponseEntity<ErrorResponse> handleTooManyLoginAttempts(TooManyLoginAttemptsException ex,
+                                                                     HttpServletRequest request) {
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                // Seconds, rounded up: a Retry-After of 0 would invite an
+                // immediate retry that is still too early.
+                .header(HttpHeaders.RETRY_AFTER, String.valueOf(Math.max(1, ex.getRetryAfter().toSeconds())))
+                .body(body(HttpStatus.TOO_MANY_REQUESTS, ex.getErrorCode(), ex.getMessage(), request, List.of()));
+    }
+
     @ExceptionHandler(IllegalArgumentException.class)
     public ResponseEntity<ErrorResponse> handleIllegalArgument(IllegalArgumentException ex, HttpServletRequest request) {
         return build(HttpStatus.BAD_REQUEST, "INVALID_ARGUMENT", ex.getMessage(), request, List.of());
@@ -49,7 +66,12 @@ public class GlobalExceptionHandler {
 
     private ResponseEntity<ErrorResponse> build(HttpStatus status, String errorCode, String message,
                                                  HttpServletRequest request, List<ErrorResponse.FieldError> fieldErrors) {
-        ErrorResponse body = new ErrorResponse(
+        return ResponseEntity.status(status).body(body(status, errorCode, message, request, fieldErrors));
+    }
+
+    private ErrorResponse body(HttpStatus status, String errorCode, String message,
+                                HttpServletRequest request, List<ErrorResponse.FieldError> fieldErrors) {
+        return new ErrorResponse(
                 Instant.now(),
                 status.value(),
                 errorCode,
@@ -57,6 +79,5 @@ public class GlobalExceptionHandler {
                 request.getRequestURI(),
                 fieldErrors
         );
-        return ResponseEntity.status(status).body(body);
     }
 }

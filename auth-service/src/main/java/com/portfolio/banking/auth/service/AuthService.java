@@ -36,6 +36,7 @@ import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.HexFormat;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.function.UnaryOperator;
 
@@ -56,6 +57,7 @@ public class AuthService implements IAuthService {
     private static final int REFRESH_TOKEN_BYTES = 32;
 
     private final IUserRepository userRepository;
+    private final LoginThrottle loginThrottle;
     private final IRefreshTokenRepository refreshTokenRepository;
     private final PasswordEncoder passwordEncoder;
     private final JwtEncoder jwtEncoder;
@@ -76,8 +78,12 @@ public class AuthService implements IAuthService {
      */
     private final TransactionTemplate revocationTransactionTemplate;
 
+    /** A valid bcrypt hash that no password matches - see {@code matchesOrBurnTheSameTime}. */
+    private final String decoyHash;
+
     public AuthService(IUserRepository userRepository,
                         IRefreshTokenRepository refreshTokenRepository,
+                        LoginThrottle loginThrottle,
                         PasswordEncoder passwordEncoder,
                         JwtEncoder jwtEncoder,
                         ServiceClientsProperties serviceClientsProperties,
@@ -87,6 +93,7 @@ public class AuthService implements IAuthService {
                         @Value("${banking.jwt.refresh-token-ttl-seconds}") long refreshTokenTtlSeconds) {
         this.userRepository = userRepository;
         this.refreshTokenRepository = refreshTokenRepository;
+        this.loginThrottle = loginThrottle;
         this.passwordEncoder = passwordEncoder;
         this.jwtEncoder = jwtEncoder;
         this.serviceClientsProperties = serviceClientsProperties;
@@ -97,6 +104,13 @@ public class AuthService implements IAuthService {
         this.revocationTransactionTemplate = new TransactionTemplate(transactionManager);
         this.revocationTransactionTemplate.setPropagationBehavior(
                 TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+        // One bcrypt at startup, so an unknown address is compared against a
+        // hash of the same shape and cost as a real one. Generated rather
+        // than hardcoded, so it always matches whatever encoder is wired in
+        // - a decoy produced by a different algorithm than the real hashes
+        // would take a different amount of time and give the game away.
+        this.decoyHash = passwordEncoder.encode(UUID.randomUUID().toString());
     }
 
     /**
@@ -135,19 +149,51 @@ public class AuthService implements IAuthService {
      * Starts a new token family. Logging in twice from two devices therefore
      * produces two independent families, so revoking one - by a logout, or
      * because one device's token was stolen - leaves the other signed in.
+     * <p>
+     * Every path out of here is deliberately indistinguishable from the
+     * others, in the response <em>and</em> on the clock. Returning the same
+     * {@link InvalidCredentialsException} for an unknown address and for a
+     * wrong password only hides which happened if the two also take the same
+     * time, and until {@link #matchesOrBurnTheSameTime} they did not: an
+     * unknown address returned before any hashing, a known one after ~100ms
+     * of bcrypt. That gap is a perfectly usable oracle for reading a user list
+     * out of a service that never returns one, and it needs no repeated
+     * attempts to exploit - just a stopwatch.
      */
     @Override
     @Transactional
     public TokenResponse login(LoginRequest request) {
-        User user = userRepository.findByEmail(request.email().toLowerCase())
-                // Same exception either way: which of "unknown email" or
-                // "wrong password" actually happened is not something a
-                // caller needs, or should get, to distinguish.
-                .orElseThrow(InvalidCredentialsException::new);
-        if (!passwordEncoder.matches(request.password(), user.getPasswordHash())) {
+        String email = request.email().toLowerCase();
+        Instant now = Instant.now();
+
+        // Before the password is looked at, so a throttled address costs no
+        // bcrypt: otherwise rejecting an attacker is more expensive for us
+        // than making the attempt is for them.
+        loginThrottle.assertNotThrottled(email, now);
+
+        Optional<User> user = userRepository.findByEmail(email);
+        if (!matchesOrBurnTheSameTime(request.password(), user)) {
+            loginThrottle.recordFailure(email, now);
             throw new InvalidCredentialsException();
         }
-        return issueTokenPair(user, UUID.randomUUID(), Instant.now());
+
+        loginThrottle.recordSuccess(email);
+        return issueTokenPair(user.orElseThrow(), UUID.randomUUID(), now);
+    }
+
+    /**
+     * Verifies the password, and takes just as long to fail for an address
+     * that does not exist as for one that does.
+     * <p>
+     * The comparison against {@link #decoyHash} is guaranteed to fail - that
+     * is not the point of making it. It is there so the work is done either
+     * way, since the whole cost of a login is the hash comparison and skipping
+     * it is loudly visible from outside.
+     */
+    private boolean matchesOrBurnTheSameTime(String presentedPassword, Optional<User> user) {
+        String hashToCompareAgainst = user.map(User::getPasswordHash).orElse(decoyHash);
+        boolean matches = passwordEncoder.matches(presentedPassword, hashToCompareAgainst);
+        return matches && user.isPresent();
     }
 
     /**
