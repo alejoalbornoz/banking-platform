@@ -3,7 +3,10 @@ package com.portfolio.banking.auth.service;
 import com.portfolio.banking.auth.alert.IRefreshTokenReuseAlerter;
 import com.portfolio.banking.auth.config.ServiceClientsProperties;
 import com.portfolio.banking.auth.dto.LoginRequest;
+import com.portfolio.banking.auth.dto.ChangePasswordRequest;
+import com.portfolio.banking.auth.dto.ForgotPasswordRequest;
 import com.portfolio.banking.auth.dto.RefreshTokenRequest;
+import com.portfolio.banking.auth.dto.ResetPasswordRequest;
 import com.portfolio.banking.auth.dto.RegisterRequest;
 import com.portfolio.banking.auth.dto.ServiceTokenRequest;
 import com.portfolio.banking.auth.dto.TokenResponse;
@@ -11,8 +14,11 @@ import com.portfolio.banking.auth.dto.UserResponse;
 import com.portfolio.banking.auth.exception.EmailAlreadyExistsException;
 import com.portfolio.banking.auth.exception.InvalidCredentialsException;
 import com.portfolio.banking.auth.exception.TooManyLoginAttemptsException;
+import com.portfolio.banking.auth.model.PasswordResetToken;
 import com.portfolio.banking.auth.model.RefreshToken;
 import com.portfolio.banking.auth.model.User;
+import com.portfolio.banking.auth.notify.IPasswordResetNotifier;
+import com.portfolio.banking.auth.repository.IPasswordResetTokenRepository;
 import com.portfolio.banking.auth.repository.IRefreshTokenRepository;
 import com.portfolio.banking.auth.repository.IUserRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -56,6 +62,7 @@ class AuthServiceTest {
 
     private static final long USER_TOKEN_TTL_SECONDS = 900L;
     private static final long REFRESH_TOKEN_TTL_SECONDS = 2592000L;
+    private static final long PASSWORD_RESET_TTL_SECONDS = 900L;
     private static final long SERVICE_TOKEN_TTL_SECONDS = 43200L;
     private static final String SERVICE_CLIENT_ID = "transaction-service";
     private static final String SERVICE_CLIENT_SECRET = "the-real-secret";
@@ -75,6 +82,12 @@ class AuthServiceTest {
     @Mock
     private IRefreshTokenReuseAlerter refreshTokenReuseAlerter;
 
+    @Mock
+    private IPasswordResetTokenRepository passwordResetTokenRepository;
+
+    @Mock
+    private IPasswordResetNotifier passwordResetNotifier;
+
     private final PasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
     private AuthService authService;
@@ -91,10 +104,12 @@ class AuthServiceTest {
         lenient().when(transactionManager.getTransaction(any())).thenReturn(mock(TransactionStatus.class));
 
         authService = new AuthService(
-                userRepository, refreshTokenRepository, loginThrottle, refreshTokenReuseAlerter,
+                userRepository, refreshTokenRepository, passwordResetTokenRepository,
+                passwordResetNotifier, loginThrottle, refreshTokenReuseAlerter,
                 passwordEncoder, jwtEncoder,
                 serviceClientsProperties, transactionManager,
-                USER_TOKEN_TTL_SECONDS, SERVICE_TOKEN_TTL_SECONDS, REFRESH_TOKEN_TTL_SECONDS);
+                USER_TOKEN_TTL_SECONDS, SERVICE_TOKEN_TTL_SECONDS, REFRESH_TOKEN_TTL_SECONDS,
+                PASSWORD_RESET_TTL_SECONDS);
     }
 
     @Test
@@ -448,6 +463,136 @@ class AuthServiceTest {
         authService.logout(new RefreshTokenRequest(RAW_TOKEN));
 
         verify(refreshTokenRepository, never()).revokeFamily(any(), any());
+    }
+
+    /**
+     * The reason a password change is worth anything. Almost every reason to
+     * change a password is a suspicion that somebody else has it - and if
+     * they hold a refresh token they can rotate it forever, so a change that
+     * leaves their session alive fixes nothing while looking like it did.
+     */
+    @Test
+    void changePassword_endsEverySessionTheUserHas() {
+        UUID userId = UUID.randomUUID();
+        User user = userWithId(userId, "user@example.com", passwordEncoder.encode("old-password"));
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        authService.changePassword(userId, new ChangePasswordRequest("old-password", "brand-new-password"));
+
+        assertThat(passwordEncoder.matches("brand-new-password", user.getPasswordHash())).isTrue();
+        verify(refreshTokenRepository).revokeAllForUser(eq(userId), any());
+        // A reset token issued before the change would otherwise still be
+        // spendable afterwards - so whoever requested one could take the
+        // account straight back.
+        verify(passwordResetTokenRepository).invalidateOutstandingFor(eq(userId), any());
+    }
+
+    @Test
+    void changePassword_wrongCurrentPassword_changesNothing() {
+        UUID userId = UUID.randomUUID();
+        User user = userWithId(userId, "user@example.com", passwordEncoder.encode("old-password"));
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        assertThatThrownBy(() -> authService.changePassword(userId,
+                new ChangePasswordRequest("not-the-old-password", "brand-new-password")))
+                .isInstanceOf(InvalidCredentialsException.class);
+
+        assertThat(passwordEncoder.matches("old-password", user.getPasswordHash())).isTrue();
+        verify(refreshTokenRepository, never()).revokeAllForUser(any(), any());
+    }
+
+    @Test
+    void requestPasswordReset_knownAddress_storesOnlyTheHashAndMailsTheToken() {
+        UUID userId = UUID.randomUUID();
+        when(userRepository.findByEmail("user@example.com"))
+                .thenReturn(Optional.of(userWithId(userId, "user@example.com", "irrelevant")));
+
+        authService.requestPasswordReset(new ForgotPasswordRequest("user@example.com"));
+
+        ArgumentCaptor<String> mailedToken = ArgumentCaptor.forClass(String.class);
+        verify(passwordResetNotifier).sendPasswordReset(eq("user@example.com"), mailedToken.capture());
+
+        ArgumentCaptor<PasswordResetToken> stored = ArgumentCaptor.forClass(PasswordResetToken.class);
+        verify(passwordResetTokenRepository).save(stored.capture());
+        assertThat(stored.getValue().getTokenHash())
+                .as("the token itself is emailed, never written down")
+                .isNotEqualTo(mailedToken.getValue())
+                .isEqualTo(sha256Hex(mailedToken.getValue()));
+        // Asking twice must not leave two live keys to one account.
+        verify(passwordResetTokenRepository).invalidateOutstandingFor(eq(userId), any());
+    }
+
+    /**
+     * The whole security design of the forgot endpoint. Answering differently
+     * for an unregistered address would be a user-enumeration oracle needing
+     * no password guesses at all - undoing here what the identical login
+     * error and the address-keyed throttle exist to prevent everywhere else.
+     */
+    @Test
+    void requestPasswordReset_unknownAddress_doesNothingAndSaysNothing() {
+        when(userRepository.findByEmail("nobody@example.com")).thenReturn(Optional.empty());
+
+        authService.requestPasswordReset(new ForgotPasswordRequest("nobody@example.com"));
+
+        verify(passwordResetTokenRepository, never()).save(any());
+        verify(passwordResetNotifier, never()).sendPasswordReset(any(), any());
+    }
+
+    @Test
+    void resetPassword_validToken_spendsItAndEndsEverySession() {
+        UUID userId = UUID.randomUUID();
+        PasswordResetToken token = resetToken(userId, Instant.now().plusSeconds(600));
+        User user = userWithId(userId, "user@example.com", passwordEncoder.encode("forgotten"));
+        when(passwordResetTokenRepository.findByTokenHash(sha256Hex(RAW_TOKEN))).thenReturn(Optional.of(token));
+        when(passwordResetTokenRepository.consume(eq(token.getId()), any())).thenReturn(1);
+        when(userRepository.findById(userId)).thenReturn(Optional.of(user));
+
+        authService.resetPassword(new ResetPasswordRequest(RAW_TOKEN, "a-new-password"));
+
+        assertThat(passwordEncoder.matches("a-new-password", user.getPasswordHash())).isTrue();
+        verify(refreshTokenRepository).revokeAllForUser(eq(userId), any());
+    }
+
+    /**
+     * Single use is decided by the conditional UPDATE, not by reading the
+     * row: two requests presenting one token would both see it unspent, and
+     * the second would set the password to whatever the second asked for.
+     */
+    @Test
+    void resetPassword_alreadySpentToken_isRefused() {
+        PasswordResetToken token = resetToken(UUID.randomUUID(), Instant.now().plusSeconds(600));
+        when(passwordResetTokenRepository.findByTokenHash(sha256Hex(RAW_TOKEN))).thenReturn(Optional.of(token));
+        when(passwordResetTokenRepository.consume(eq(token.getId()), any())).thenReturn(0);
+
+        assertThatThrownBy(() -> authService.resetPassword(new ResetPasswordRequest(RAW_TOKEN, "a-new-password")))
+                .isInstanceOf(InvalidCredentialsException.class);
+
+        verify(refreshTokenRepository, never()).revokeAllForUser(any(), any());
+    }
+
+    @Test
+    void resetPassword_expiredToken_isRefusedWithoutSpendingIt() {
+        PasswordResetToken token = resetToken(UUID.randomUUID(), Instant.now().minusSeconds(1));
+        when(passwordResetTokenRepository.findByTokenHash(sha256Hex(RAW_TOKEN))).thenReturn(Optional.of(token));
+
+        assertThatThrownBy(() -> authService.resetPassword(new ResetPasswordRequest(RAW_TOKEN, "a-new-password")))
+                .isInstanceOf(InvalidCredentialsException.class);
+
+        verify(passwordResetTokenRepository, never()).consume(any(), any());
+    }
+
+    @Test
+    void resetPassword_unknownToken_isRefused() {
+        when(passwordResetTokenRepository.findByTokenHash(sha256Hex(RAW_TOKEN))).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> authService.resetPassword(new ResetPasswordRequest(RAW_TOKEN, "a-new-password")))
+                .isInstanceOf(InvalidCredentialsException.class);
+    }
+
+    private static PasswordResetToken resetToken(UUID userId, Instant expiresAt) {
+        PasswordResetToken token = new PasswordResetToken(sha256Hex(RAW_TOKEN), userId, expiresAt);
+        ReflectionTestUtils.setField(token, "id", UUID.randomUUID());
+        return token;
     }
 
     /** Any value works - what matters is that the service hashes it before looking it up. */

@@ -47,6 +47,7 @@ approached rather than to run it:
 | [Idempotent consumption](#consuming-idempotently-and-dead-lettering-what-cant-be-handled-notification-service) | The same constraint trick on the consumer side, plus dead-lettering what can never be processed |
 | [Authentication](#authentication-auth-service-api-gateway) | RS256 and a published JWK set, and why crediting a transfer's destination can never pass an ownership check |
 | [Refresh tokens](#refresh-tokens-rotation-and-detecting-theft) | How rotation turns a stolen token from undetectable into self-announcing, and why the revocation needs its own transaction |
+| [Password change and reset](#changing-and-recovering-a-password) | Why a password change that leaves other sessions alive is worse than not offering one |
 | [Login throttling](#throttling-the-front-door-without-handing-out-a-new-attack) | Why lockout is a worse attack than the one it prevents, and how a throttle can accidentally become the user-enumeration oracle it sits next to |
 | [Alerting](#alerting-what-happens-when-nobody-is-watching) | Two signals with different correct values, and why that means they cannot share an alert rule |
 | [Pagination](#paginating-the-lists-all-three-services) | Why a cursor and not an offset, and the reconciliation check that paginating a statement quietly turns into a lie |
@@ -99,6 +100,8 @@ straight to "Trying the API" below, on port 8080.
 - Zipkin on `9411` (UI at http://localhost:9411)
 - Prometheus on `9090` (UI at http://localhost:9090, alert state at
   http://localhost:9090/alerts)
+- Mailpit on `1025` (SMTP) and `8025` (UI) - catches the password-reset
+  emails so nothing leaves the machine
 
 The services are also published individually on `8081`-`8084`, which is
 useful for looking at one service's `/actuator` directly, though normal
@@ -873,6 +876,68 @@ than with users is fine for a year and then is not. The week of retention is
 deliberate: a token deleted the instant it expires comes back as *unknown*,
 indistinguishable from one that never existed, which is a worse story in the
 logs when someone is investigating.
+
+### Changing and recovering a password
+
+There were tokens with rotation, theft detection and a login throttle, and no
+way to change the password any of it protected. Two flows now exist, and both
+end in the same place.
+
+**A password change ends every session, everywhere.** This is the part that
+matters, not a courtesy. Almost every reason to change a password is a
+suspicion that somebody else has it — and if that somebody holds a refresh
+token, they can rotate it indefinitely. A change that leaves their session
+alive fixes nothing while looking like it fixed everything, which is worse
+than not offering the feature at all, because the owner stops worrying. So
+`revokeAllForUser` takes down every family, not just the caller's own.
+
+**The current password is required even though the caller already presented a
+token.** A token lives in a browser and survives a borrowed laptop; the
+password is the thing only the real owner knows. Without that check, a stolen
+access token could be traded for permanent control of the account inside its
+fifteen-minute life.
+
+**`POST /password/forgot` always answers `202`**, registered address or not.
+That is the entire security design of the endpoint rather than laziness:
+answering "no such user" would be a user-enumeration oracle needing no
+password guesses and no repeated attempts — undoing here exactly what the
+identical login error and the address-keyed throttle exist to prevent
+everywhere else.
+
+The reset token is the same construction as a refresh token — 256 random bits,
+base64url, stored only as its SHA-256 — with a much shorter life, because for
+as long as it exists it *is* the password. It is single-use, and which request
+gets to spend it is decided by the same conditional UPDATE as refresh-token
+consumption: two requests presenting one token would both read it as unspent,
+and the second would set the password to whatever the second asked for.
+
+Three things happen together on any password change, whichever route arrived
+at it — the new hash, every session revoked, and every outstanding reset token
+spent. That third one is the easy one to forget: a reset token issued *before*
+the change would otherwise still be spendable afterwards, so an attacker who
+requested one, then watched the owner change their password, would simply use
+it and take the account straight back.
+
+**Auth-service now validates its own tokens**, for exactly one route.
+Everything else here is the way in and cannot demand a token. Its `JwtDecoder`
+is built from the in-memory keypair rather than by fetching its own
+`/.well-known/jwks.json` — the other three services have no choice, since the
+key lives in another process, but a service resolving its own JWK set over the
+network would add a startup dependency on itself.
+
+Note the ordering in `SecurityConfig`: `/password` requires a token while
+`/password/forgot` and `/password/reset` must not, since they are for people
+who cannot sign in. Spring matches in declaration order, so a
+`"/api/v1/auth/password/**"` written first would have locked out precisely the
+users the reset flow exists for.
+
+**Where the email goes.** `docker-compose.yml` runs Mailpit, a mail catcher
+that speaks real SMTP, delivers nothing, and shows every message it swallowed
+at http://localhost:8025. The alternative for a project with no mail provider
+is to log the token — and that was rejected on purpose: a reset token is the
+password for as long as it lives, and logs are the one place credentials get
+copied, shipped and retained by default. One container is a cheap way to avoid
+writing an account takeover into a log file.
 
 ## Alerting: what happens when nobody is watching
 

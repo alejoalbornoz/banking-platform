@@ -44,6 +44,16 @@ public class User {
         this.passwordHash = passwordHash;
     }
 
+    /**
+     * Replaces the stored hash. The caller is responsible for having proved
+     * the right to do so - by presenting the current password, or by spending
+     * a reset token - and for revoking the sessions this invalidates, neither
+     * of which an entity can check.
+     */
+    public void changePasswordHash(String newPasswordHash) {
+        this.passwordHash = newPasswordHash;
+    }
+
     public UUID getId() {
         return id;
     }

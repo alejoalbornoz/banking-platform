@@ -28,6 +28,15 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-validation</artifactId>
         </dependency>
+
+        <!-- Sends the password-reset link. In this project that goes to
+             Mailpit (see docker-compose.yml), which catches everything and
+             delivers nothing - so the flow is real without any mail
+             escaping, and no reset token ever has to be written to a log. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-mail</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-actuator</artifactId>
@@ -56,6 +65,17 @@
         <dependency>
             <groupId>org.springframework.security</groupId>
             <artifactId>spring-security-oauth2-jose</artifactId>
+        </dependency>
+
+        <!-- jose above SIGNS the tokens this service hands out; this one
+             VALIDATES them. Needed because auth-service is now a resource
+             server for exactly one route, POST /api/v1/auth/password -
+             changing a password is something an already-signed-in user
+             does. Everything else here is the way in and cannot demand a
+             token. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
         </dependency>
 
         <!-- Serves this service's own OpenAPI document and Swagger UI. -->

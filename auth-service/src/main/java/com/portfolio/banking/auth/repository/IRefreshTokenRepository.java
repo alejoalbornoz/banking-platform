@@ -69,6 +69,24 @@ public interface IRefreshTokenRepository extends JpaRepository<RefreshToken, UUI
     int revokeFamily(@Param("familyId") UUID familyId, @Param("now") Instant now);
 
     /**
+     * Ends every session this user has anywhere, across all families.
+     * <p>
+     * What makes a password change worth anything. Revoking only the caller's
+     * own family would leave whoever stole the password still holding a live
+     * refresh token, quietly rotating it forever - the account would keep
+     * being theirs after the owner had already "fixed" it.
+     */
+    @Modifying
+    @Transactional
+    @Query("""
+            UPDATE RefreshToken t
+               SET t.revokedAt = :now
+             WHERE t.userId = :userId
+               AND t.revokedAt IS NULL
+            """)
+    int revokeAllForUser(@Param("userId") UUID userId, @Param("now") Instant now);
+
+    /**
      * Drops rows that expired long enough ago to be of no further use, so the
      * table doesn't grow for the lifetime of the deployment. Deleting them
      * the moment they expire would be a mistake: a reuse attempt against a

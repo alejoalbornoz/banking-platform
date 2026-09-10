@@ -3,15 +3,21 @@ package com.portfolio.banking.auth.service;
 import com.portfolio.banking.auth.alert.IRefreshTokenReuseAlerter;
 import com.portfolio.banking.auth.config.ServiceClientsProperties;
 import com.portfolio.banking.auth.dto.LoginRequest;
+import com.portfolio.banking.auth.dto.ChangePasswordRequest;
+import com.portfolio.banking.auth.dto.ForgotPasswordRequest;
 import com.portfolio.banking.auth.dto.RefreshTokenRequest;
+import com.portfolio.banking.auth.dto.ResetPasswordRequest;
 import com.portfolio.banking.auth.dto.RegisterRequest;
 import com.portfolio.banking.auth.dto.ServiceTokenRequest;
 import com.portfolio.banking.auth.dto.TokenResponse;
 import com.portfolio.banking.auth.dto.UserResponse;
 import com.portfolio.banking.auth.exception.EmailAlreadyExistsException;
 import com.portfolio.banking.auth.exception.InvalidCredentialsException;
+import com.portfolio.banking.auth.model.PasswordResetToken;
 import com.portfolio.banking.auth.model.RefreshToken;
 import com.portfolio.banking.auth.model.User;
+import com.portfolio.banking.auth.notify.IPasswordResetNotifier;
+import com.portfolio.banking.auth.repository.IPasswordResetTokenRepository;
 import com.portfolio.banking.auth.repository.IRefreshTokenRepository;
 import com.portfolio.banking.auth.repository.IUserRepository;
 import org.slf4j.Logger;
@@ -61,12 +67,15 @@ public class AuthService implements IAuthService {
     private final LoginThrottle loginThrottle;
     private final IRefreshTokenReuseAlerter refreshTokenReuseAlerter;
     private final IRefreshTokenRepository refreshTokenRepository;
+    private final IPasswordResetTokenRepository passwordResetTokenRepository;
+    private final IPasswordResetNotifier passwordResetNotifier;
     private final PasswordEncoder passwordEncoder;
     private final JwtEncoder jwtEncoder;
     private final ServiceClientsProperties serviceClientsProperties;
     private final long userTokenTtlSeconds;
     private final long serviceTokenTtlSeconds;
     private final long refreshTokenTtlSeconds;
+    private final long passwordResetTtlSeconds;
     private final SecureRandom secureRandom = new SecureRandom();
 
     /**
@@ -85,6 +94,8 @@ public class AuthService implements IAuthService {
 
     public AuthService(IUserRepository userRepository,
                         IRefreshTokenRepository refreshTokenRepository,
+                        IPasswordResetTokenRepository passwordResetTokenRepository,
+                        IPasswordResetNotifier passwordResetNotifier,
                         LoginThrottle loginThrottle,
                         IRefreshTokenReuseAlerter refreshTokenReuseAlerter,
                         PasswordEncoder passwordEncoder,
@@ -93,9 +104,12 @@ public class AuthService implements IAuthService {
                         PlatformTransactionManager transactionManager,
                         @Value("${banking.jwt.user-token-ttl-seconds}") long userTokenTtlSeconds,
                         @Value("${banking.jwt.service-token-ttl-seconds}") long serviceTokenTtlSeconds,
-                        @Value("${banking.jwt.refresh-token-ttl-seconds}") long refreshTokenTtlSeconds) {
+                        @Value("${banking.jwt.refresh-token-ttl-seconds}") long refreshTokenTtlSeconds,
+                        @Value("${banking.password-reset.token-ttl-seconds}") long passwordResetTtlSeconds) {
         this.userRepository = userRepository;
         this.refreshTokenRepository = refreshTokenRepository;
+        this.passwordResetTokenRepository = passwordResetTokenRepository;
+        this.passwordResetNotifier = passwordResetNotifier;
         this.loginThrottle = loginThrottle;
         this.refreshTokenReuseAlerter = refreshTokenReuseAlerter;
         this.passwordEncoder = passwordEncoder;
@@ -104,6 +118,7 @@ public class AuthService implements IAuthService {
         this.userTokenTtlSeconds = userTokenTtlSeconds;
         this.serviceTokenTtlSeconds = serviceTokenTtlSeconds;
         this.refreshTokenTtlSeconds = refreshTokenTtlSeconds;
+        this.passwordResetTtlSeconds = passwordResetTtlSeconds;
 
         this.revocationTransactionTemplate = new TransactionTemplate(transactionManager);
         this.revocationTransactionTemplate.setPropagationBehavior(
@@ -267,6 +282,113 @@ public class AuthService implements IAuthService {
                 .ifPresent(token -> refreshTokenRepository.revokeFamily(token.getFamilyId(), Instant.now()));
     }
 
+    /**
+     * Changes the password of the authenticated caller, and ends every one of
+     * their sessions.
+     * <p>
+     * <b>The revocation is the point, not a courtesy.</b> Almost every reason
+     * to change a password is a suspicion that somebody else has it - and if
+     * that somebody holds a refresh token, they can rotate it forever. A
+     * password change that leaves their session alive fixes nothing while
+     * looking like it fixed everything, which is worse than not offering the
+     * feature: the owner stops worrying.
+     * <p>
+     * The current password is required even though the caller already
+     * presented a valid access token. A token lives in a browser and survives
+     * a borrowed laptop; the password is what only the real owner knows.
+     * Without that check, a stolen access token could be traded for permanent
+     * control of the account inside its fifteen-minute life.
+     */
+    @Override
+    @Transactional
+    public void changePassword(UUID userId, ChangePasswordRequest request) {
+        User user = userRepository.findById(userId).orElseThrow(InvalidCredentialsException::new);
+        if (!passwordEncoder.matches(request.currentPassword(), user.getPasswordHash())) {
+            throw new InvalidCredentialsException();
+        }
+        applyNewPassword(user, request.newPassword());
+    }
+
+    /**
+     * Always succeeds, whether or not the address is registered - and that is
+     * the entire security design of this endpoint rather than laziness. An
+     * endpoint that answered "no such user" would be a user-enumeration
+     * oracle needing no password guesses and no repeated attempts, which is
+     * exactly what the identical login error and the address-keyed login
+     * throttle already exist to prevent. Undoing that here would undo it
+     * everywhere.
+     * <p>
+     * Issuing a token invalidates whatever that user still had outstanding,
+     * so asking twice does not leave two live keys to the account.
+     */
+    @Override
+    @Transactional
+    public void requestPasswordReset(ForgotPasswordRequest request) {
+        String email = request.email().toLowerCase();
+        Optional<User> user = userRepository.findByEmail(email);
+        if (user.isEmpty()) {
+            return;
+        }
+
+        Instant now = Instant.now();
+        passwordResetTokenRepository.invalidateOutstandingFor(user.get().getId(), now);
+
+        String token = generateOpaqueToken();
+        passwordResetTokenRepository.save(new PasswordResetToken(
+                hash(token), user.get().getId(), now.plusSeconds(passwordResetTtlSeconds)));
+
+        // Never logged, and held only here and in the message that carries it.
+        passwordResetNotifier.sendPasswordReset(email, token);
+    }
+
+    /**
+     * Spends a reset token and sets the new password.
+     * <p>
+     * Like refresh-token consumption, whether the token may be spent is
+     * decided by a conditional UPDATE rather than by reading the row: two
+     * requests presenting the same token would both read {@code usedAt ==
+     * null} and both proceed, and the second would set the password to
+     * whatever the second request asked for.
+     */
+    @Override
+    @Transactional
+    public void resetPassword(ResetPasswordRequest request) {
+        PasswordResetToken presented = passwordResetTokenRepository
+                .findByTokenHash(hash(request.token()))
+                .orElseThrow(InvalidCredentialsException::new);
+
+        Instant now = Instant.now();
+        if (presented.isExpired(now) || passwordResetTokenRepository.consume(presented.getId(), now) == 0) {
+            throw new InvalidCredentialsException();
+        }
+
+        User user = userRepository.findById(presented.getUserId())
+                .orElseThrow(InvalidCredentialsException::new);
+        applyNewPassword(user, request.newPassword());
+    }
+
+    /**
+     * The three things that have to happen together, whichever route got
+     * here: the new hash, every session gone, and every outstanding reset
+     * token spent.
+     * <p>
+     * That last one is easy to forget. A reset token issued before the change
+     * would otherwise still be spendable afterwards - so an attacker who
+     * requested one, then watched the owner change their password, would
+     * simply use it and take the account back.
+     */
+    private void applyNewPassword(User user, String newPassword) {
+        Instant now = Instant.now();
+        user.changePasswordHash(passwordEncoder.encode(newPassword));
+        userRepository.save(user);
+
+        refreshTokenRepository.revokeAllForUser(user.getId(), now);
+        passwordResetTokenRepository.invalidateOutstandingFor(user.getId(), now);
+        // The counter is cleared too: whatever failed attempts accumulated
+        // were against a password that no longer exists.
+        loginThrottle.recordSuccess(user.getEmail());
+    }
+
     @Override
     public TokenResponse issueServiceToken(ServiceTokenRequest request) {
         String configuredSecret = serviceClientsProperties.getServiceClients().get(request.clientId());
@@ -318,15 +440,21 @@ public class AuthService implements IAuthService {
                 .claim("email", user.getEmail())
                 .claim("role", ROLE_USER));
 
-        String refreshToken = generateRefreshToken();
+        String refreshToken = generateOpaqueToken();
         refreshTokenRepository.save(new RefreshToken(
                 hash(refreshToken), user.getId(), familyId, now.plusSeconds(refreshTokenTtlSeconds)));
 
         return new TokenResponse(accessToken, userTokenTtlSeconds, refreshToken, refreshTokenTtlSeconds);
     }
 
-    /** Base64url so the token survives a JSON body and a header untouched. */
-    private String generateRefreshToken() {
+    /**
+     * Base64url so the token survives a JSON body, a header and a query
+     * string untouched. Used for both refresh tokens and password-reset
+     * tokens: both are credentials nobody guesses, only steals, so the
+     * only property either needs is enough entropy to put brute force out
+     * of reach.
+     */
+    private String generateOpaqueToken() {
         byte[] raw = new byte[REFRESH_TOKEN_BYTES];
         secureRandom.nextBytes(raw);
         return Base64.getUrlEncoder().withoutPadding().encodeToString(raw);

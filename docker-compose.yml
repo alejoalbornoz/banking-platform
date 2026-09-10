@@ -42,6 +42,18 @@ services:
     ports:
       - "9411:9411" # UI: http://localhost:9411
 
+  # A mail catcher: speaks real SMTP, delivers nothing, and shows every
+  # message it swallowed at http://localhost:8025. The password-reset flow
+  # needs somewhere to send a token, and the alternative for a project with
+  # no mail provider is to log it - which would put an account takeover in a
+  # log file, the one place credentials get shipped and retained by default.
+  mailpit:
+    image: axllent/mailpit:v1.20
+    container_name: banking-mailpit
+    ports:
+      - "1025:1025" # SMTP
+      - "8025:8025" # UI and API
+
   # Scrapes every service's /actuator/prometheus and evaluates the alert
   # rules. Depends on nothing: a monitoring system that will not start until
   # the things it monitors are healthy is useless exactly when it is needed,
@@ -82,6 +94,9 @@ services:
       ACCOUNT_SERVICE_HOST: account-service
       TRANSACTION_SERVICE_HOST: transaction-service
       NOTIFICATION_SERVICE_HOST: notification-service
+      # Only auth-service sends mail, but the anchor is shared by all
+      # five and an unused variable costs nothing.
+      MAIL_HOST: mailpit
     ports:
       - "8084:8084"
     depends_on:

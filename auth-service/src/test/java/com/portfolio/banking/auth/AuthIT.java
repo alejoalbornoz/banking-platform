@@ -1,12 +1,16 @@
 package com.portfolio.banking.auth;
 
 import com.portfolio.banking.auth.dto.LoginRequest;
+import com.portfolio.banking.auth.dto.ChangePasswordRequest;
+import com.portfolio.banking.auth.dto.ForgotPasswordRequest;
 import com.portfolio.banking.auth.dto.RefreshTokenRequest;
+import com.portfolio.banking.auth.dto.ResetPasswordRequest;
 import com.portfolio.banking.auth.dto.RegisterRequest;
 import com.portfolio.banking.auth.dto.ServiceTokenRequest;
 import com.portfolio.banking.auth.dto.TokenResponse;
 import com.portfolio.banking.auth.dto.UserResponse;
 import com.portfolio.banking.auth.model.LoginAttempt;
+import com.portfolio.banking.auth.notify.IPasswordResetNotifier;
 import com.portfolio.banking.auth.repository.ILoginAttemptRepository;
 import com.portfolio.banking.auth.repository.IRefreshTokenRepository;
 import com.portfolio.banking.auth.repository.IUserRepository;
@@ -14,13 +18,17 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
+import org.mockito.ArgumentCaptor;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
@@ -41,6 +49,10 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 
 /**
  * Covers the parts of auth-service that {@code AuthServiceTest} structurally
@@ -95,6 +107,14 @@ class AuthIT {
 
     @Autowired
     private PasswordEncoder passwordEncoder;
+
+    /**
+     * The one step of the reset flow that leaves this system. Mocked so
+     * the token can be captured; that it really goes out over SMTP is a
+     * property of the mail server, not of this service.
+     */
+    @MockBean
+    private IPasswordResetNotifier passwordResetNotifier;
 
     /**
      * Swaps out the request factory {@code TestRestTemplate} defaults to,
@@ -423,6 +443,95 @@ class AuthIT {
         assertThat(loginAttemptRepository.findById(email))
                 .as("remembering your password should not leave you serving out a delay")
                 .isEmpty();
+    }
+
+    /**
+     * The claim that makes a password change worth making, and the one a
+     * mocked repository cannot settle: {@code revokeAllForUser} is a single
+     * UPDATE, and whether it really reaches a session started on another
+     * device - a different family entirely - is a fact about SQL.
+     */
+    @Test
+    void changingThePassword_endsSessionsStartedOnOtherDevices() {
+        String email = uniqueEmail();
+        restTemplate.postForEntity("/api/v1/auth/register",
+                new RegisterRequest(email, "password123"), UserResponse.class);
+        TokenResponse laptop = logIn(email);
+        TokenResponse phone = logIn(email);
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setBearerAuth(laptop.accessToken());
+        ResponseEntity<Void> changed = restTemplate.exchange("/api/v1/auth/password", HttpMethod.POST,
+                new HttpEntity<>(new ChangePasswordRequest("password123", "a-new-password"), headers),
+                Void.class);
+        assertThat(changed.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+
+        assertThat(refreshWith(phone.refreshToken()).getStatusCode())
+                .as("the other device's session is gone too, not just the one that asked")
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(refreshWith(laptop.refreshToken()).getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+
+        assertThat(restTemplate.postForEntity("/api/v1/auth/login",
+                new LoginRequest(email, "a-new-password"), TokenResponse.class).getStatusCode())
+                .as("and the new password works")
+                .isEqualTo(HttpStatus.OK);
+    }
+
+    @Test
+    void changingThePassword_requiresAToken() {
+        assertThat(restTemplate.postForEntity("/api/v1/auth/password",
+                new ChangePasswordRequest("whatever", "a-new-password"), String.class).getStatusCode())
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
+    @Test
+    void theResetFlow_worksEndToEndAndTheTokenIsSingleUse() {
+        String email = uniqueEmail();
+        restTemplate.postForEntity("/api/v1/auth/register",
+                new RegisterRequest(email, "password123"), UserResponse.class);
+        TokenResponse session = logIn(email);
+
+        assertThat(restTemplate.postForEntity("/api/v1/auth/password/forgot",
+                new ForgotPasswordRequest(email), Void.class).getStatusCode())
+                .isEqualTo(HttpStatus.ACCEPTED);
+
+        ArgumentCaptor<String> token = ArgumentCaptor.forClass(String.class);
+        verify(passwordResetNotifier).sendPasswordReset(eq(email), token.capture());
+
+        assertThat(restTemplate.postForEntity("/api/v1/auth/password/reset",
+                new ResetPasswordRequest(token.getValue(), "recovered-password"), Void.class).getStatusCode())
+                .isEqualTo(HttpStatus.NO_CONTENT);
+
+        // Spent: the same token cannot be replayed to set it again.
+        assertThat(restTemplate.postForEntity("/api/v1/auth/password/reset",
+                new ResetPasswordRequest(token.getValue(), "attacker-password"), String.class).getStatusCode())
+                .isEqualTo(HttpStatus.UNAUTHORIZED);
+
+        // A reset ends sessions exactly like a change does - the likeliest
+        // reason to reset is that somebody else got in.
+        assertThat(refreshWith(session.refreshToken()).getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(restTemplate.postForEntity("/api/v1/auth/login",
+                new LoginRequest(email, "recovered-password"), TokenResponse.class).getStatusCode())
+                .isEqualTo(HttpStatus.OK);
+    }
+
+    /**
+     * The forgot endpoint must not become the user-enumeration oracle the
+     * rest of this service is built to avoid: an unregistered address gets
+     * the same 202 and no mail.
+     */
+    @Test
+    void forgotPassword_forAnAddressNobodyRegistered_answersIdentically() {
+        assertThat(restTemplate.postForEntity("/api/v1/auth/password/forgot",
+                new ForgotPasswordRequest(uniqueEmail()), Void.class).getStatusCode())
+                .isEqualTo(HttpStatus.ACCEPTED);
+
+        verify(passwordResetNotifier, never()).sendPasswordReset(any(), any());
+    }
+
+    private ResponseEntity<String> refreshWith(String refreshToken) {
+        return restTemplate.postForEntity("/api/v1/auth/refresh",
+                new RefreshTokenRequest(refreshToken), String.class);
     }
 
     /** Matches {@code banking.security.login-throttle.free-attempts} in application.yml. */
