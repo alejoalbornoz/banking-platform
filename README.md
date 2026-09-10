@@ -47,6 +47,7 @@ approached rather than to run it:
 | [Authentication](#authentication-auth-service-api-gateway) | RS256 and a published JWK set, and why crediting a transfer's destination can never pass an ownership check |
 | [Refresh tokens](#refresh-tokens-rotation-and-detecting-theft) | How rotation turns a stolen token from undetectable into self-announcing, and why the revocation needs its own transaction |
 | [Login throttling](#throttling-the-front-door-without-handing-out-a-new-attack) | Why lockout is a worse attack than the one it prevents, and how a throttle can accidentally become the user-enumeration oracle it sits next to |
+| [Alerting](#alerting-what-happens-when-nobody-is-watching) | Two signals with different correct values, and why that means they cannot share an alert rule |
 | [Pagination](#paginating-the-lists-all-three-services) | Why a cursor and not an offset, and the reconciliation check that paginating a statement quietly turns into a lie |
 | [Integration tests](#integration-tests) | Four bugs that unit tests couldn't have caught, and exactly why each one was invisible |
 | [Known gaps](#known-gaps) | What isn't solved, and which of those were deliberate |
@@ -95,6 +96,8 @@ straight to "Trying the API" below, on port 8080.
   `notification_db`, `auth_db` are pre-created)
 - RabbitMQ on `5672` (management UI at http://localhost:15672, `banking`/`banking`)
 - Zipkin on `9411` (UI at http://localhost:9411)
+- Prometheus on `9090` (UI at http://localhost:9090, alert state at
+  http://localhost:9090/alerts)
 
 The services are also published individually on `8081`-`8084`, which is
 useful for looking at one service's `/actuator` directly, though normal
@@ -463,7 +466,8 @@ outcome. `StuckTransferAlerter` increments a Micrometer counter
 and `/actuator/prometheus`) and writes an ERROR log line carrying both
 failure reasons under an `OPS_ALERT` marker. The counter is what actually
 pages someone: its correct value is permanently zero, so the alert rule is
-"any increase at all", and the metric is deliberately **untagged** - tagging
+"any increase at all" - and that rule now exists, in
+`prometheus/alerts.yml`. The metric is deliberately **untagged** - tagging
 by transaction id would give a monitoring backend one new time series per
 incident, which is how cardinality explosions happen. Identifiers live in the
 log line and in `GET /api/v1/transfers/stuck`, which lists everything
@@ -823,6 +827,77 @@ deliberate: a token deleted the instant it expires comes back as *unknown*,
 indistinguishable from one that never existed, which is a worse story in the
 logs when someone is investigating.
 
+## Alerting: what happens when nobody is watching
+
+Two things in this platform genuinely need a human: money that got stuck
+mid-transfer, and a refresh token presented twice. Both already emitted a
+counter and a marked log line — and until now both emitted them into a void.
+Three services also advertised `/actuator/prometheus` while returning `404`
+for it, because the endpoint was exposed in config but no registry was on the
+classpath to render the scrape format. All five serve it now.
+
+`docker compose up` brings up Prometheus alongside the rest. It scrapes every
+service and evaluates `prometheus/alerts.yml`; alert state is at
+http://localhost:9090/alerts.
+
+**The interesting part is that the two rules are not written the same way,
+and could not be.** What rule a signal needs follows from what its correct
+value is:
+
+| Signal | Correct value | Rule |
+|---|---|---|
+| `banking_transfers_stuck_total` | exactly zero, forever | any increase at all |
+| `banking_auth_refresh_token_reuse_detected_total` | low but **not** zero | more than 5 in 15 minutes |
+
+Money stuck mid-transfer is never acceptable, so the first rule is the
+simplest one there is and waits for nothing — `for: 0m`, because the money is
+already stuck by the time it evaluates. Reuse detection is different: a client
+that fires two refreshes at once trips it with nothing stolen, so "any
+increase" would page somebody over a double-clicked button. What separates an
+attack from that is *rate*. Writing the second rule the way the first one is
+written would have produced an alert nobody trusts, and an alert nobody trusts
+is off within a week.
+
+Both use `increase(...[window])` rather than testing the counter directly,
+which is the mistake that looks correct: a counter that incremented once last
+month is still non-zero forever, so `> 0` on the raw value fires permanently
+after the first incident and never recovers.
+
+`increase()` extrapolates to the edges of its window, so it does not return
+whole numbers — one stuck transfer reads as `1.0454286910811503`. Both
+summaries round with `printf "%.0f"`, because an alert that announces
+"1.0454286910811503 transfers are stuck" reads like a bug in the alert, and
+the first thing anyone woken by it would do is go and check the alert instead
+of the money.
+
+**A third rule watches for the absence of the other two.** `up == 0` fires
+when a service stops being scrapeable — because a service nobody is scraping
+produces no increase, which is indistinguishable from good news. Without it,
+the two rules above quietly become decorative the moment something breaks in
+the wrong place.
+
+**Neither counter carries tags**, and that is deliberate in both. Tagging by
+transaction id, or by token family, would give a metrics backend one new time
+series per incident, which is exactly how a cardinality explosion starts. The
+identifiers live in the log lines (all under an `OPS_ALERT` marker, so one log
+pipeline rule covers both services) and in `GET /api/v1/transfers/stuck`. A
+metric only has to answer *is anything wrong, and how often* — the *which* is
+a different question, asked after the alert has already woken someone.
+
+Both counters are registered at startup rather than on first use, so they read
+zero from the moment a service boots. A series that only appears once
+something goes wrong gives an alert rule nothing to evaluate until the
+incident it exists to catch has already happened.
+
+**Where this stops, and why.** There is no Alertmanager. Prometheus is what
+decides an alert is firing; Alertmanager only routes an already-firing alert
+to a destination, and a Slack workspace or PagerDuty service is a credential
+for somewhere this repository does not have. The chain that can be
+demonstrated is demonstrated end to end: the metric exists, it is scraped, the
+rule evaluates, and the alert reaches `FIRING`. There is no Grafana either —
+dashboards are for looking at things you already know to look at, and the
+alerts are the part that finds you.
+
 ## Paginating the lists (all three services)
 
 Every list endpoint a user can reach returns a page, never a bare array (the
@@ -1050,16 +1125,15 @@ is set by hand (see the root `pom.xml`):
 Being explicit about what is *not* solved yet, since these are the interesting
 parts:
 
-- **Nothing consumes the stuck-transfer alert yet.** The counter and the
-  marked log line are emitted (see "When the compensation itself fails"), but
-  wiring them to something that actually wakes a person - a Prometheus alert
-  rule, a log-based monitor, a pager - is deployment configuration this repo
-  doesn't contain. The seam is `IStuckTransferAlerter`; only the last mile is
-  missing.
-- **The other three services expose `/actuator/prometheus` in config but
-  don't ship the registry that serves it.** Only transaction-service has
-  `micrometer-registry-prometheus`, added because that's where the alert
-  metric lives. The others' exposure line is currently dead config.
+- **The alerts fire, but nothing routes them.** Prometheus evaluates the
+  rules and an alert reaches `FIRING` (see "Alerting"), which is the part this
+  repository can own. Delivering that to a person means Alertmanager plus a
+  Slack workspace or a PagerDuty service, and those are credentials for
+  somewhere this repository does not have. The seams to replace are
+  `IStuckTransferAlerter` and `IRefreshTokenReuseAlerter`.
+- **No dashboards.** Grafana would be a container and a pile of provisioned
+  JSON, and dashboards are for looking at things you already know to look at.
+  The alerts are the part that finds you.
 - **There is no single "all my movements" view.** `GET /transfers` lists what
   you sent; what you received is in the account ledger and in notifications.
   Assembling one merged, paginated timeline across two services means either

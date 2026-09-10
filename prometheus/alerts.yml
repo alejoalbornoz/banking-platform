@@ -1,0 +1,65 @@
+# Two alerts, and they are deliberately not written the same way. The rule a
+# signal needs follows from what its correct value is, and these two differ.
+groups:
+  - name: banking-money
+    rules:
+      # Correct value: permanently zero. Money left an account and reached
+      # nobody, no retry fixes it, and a human has to move it. So the rule is
+      # the simplest one there is - any increase at all, ever.
+      #
+      # `increase(...[5m]) > 0` rather than `> 0` on the raw counter, because
+      # a counter that incremented once last month is still non-zero forever;
+      # what matters is that it moved recently.
+      - alert: StuckTransfer
+        expr: increase(banking_transfers_stuck_total[5m]) > 0
+        for: 0m           # no waiting: the money is already stuck
+        labels:
+          severity: critical
+        annotations:
+          # printf, because increase() extrapolates to the window edges and
+          # returns a float - an alert that says "1.0454286910811503
+          # transfers are stuck" reads like a bug in the alert.
+          summary: "Money is stuck mid-transfer ({{ $value | printf \"%.0f\" }} in the last 5m)"
+          description: >-
+            A transfer's credit failed and so did crediting the source back.
+            GET /api/v1/transfers/stuck lists them (ROLE_SERVICE). Search the
+            logs for OPS_ALERT to find the transaction ids.
+
+  - name: banking-auth
+    rules:
+      # Correct value is NOT zero, which is the whole difference. A client
+      # firing two refreshes at once trips reuse detection with nothing
+      # stolen, so "any increase" would page somebody over a double-clicked
+      # button. What separates an attack from that is rate, so this
+      # thresholds instead of triggering on the first event.
+      - alert: RefreshTokenReuseSpike
+        expr: increase(banking_auth_refresh_token_reuse_detected_total[15m]) > 5
+        # The 15-minute window is already the debounce - six events inside it
+        # is not a fluke. `for` here only guards against a single bad
+        # evaluation (one missed scrape making a counter look like it jumped),
+        # so it is short. Stacking a long `for` on top of a long window means
+        # waiting twice for the same reassurance.
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Refresh token reuse is elevated ({{ $value | printf \"%.0f\" }} in 15m)"
+          description: >-
+            Each event revoked a token family: either stolen tokens are being
+            replayed, or a client is refreshing twice. Logs under OPS_ALERT
+            carry the family and user ids.
+
+      # The counters above can only be trusted while something is reading
+      # them. A service that stops being scraped produces no increase, which
+      # looks exactly like the good news - so the absence of the signal has to
+      # alert too, or every rule here silently becomes decorative.
+      - alert: ServiceNotScraped
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.service }} has not been scrapeable for 2m"
+          description: >-
+            While this is firing, every other alert in this file is blind for
+            that service.

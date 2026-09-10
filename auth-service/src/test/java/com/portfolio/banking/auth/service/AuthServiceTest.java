@@ -1,5 +1,6 @@
 package com.portfolio.banking.auth.service;
 
+import com.portfolio.banking.auth.alert.IRefreshTokenReuseAlerter;
 import com.portfolio.banking.auth.config.ServiceClientsProperties;
 import com.portfolio.banking.auth.dto.LoginRequest;
 import com.portfolio.banking.auth.dto.RefreshTokenRequest;
@@ -71,6 +72,9 @@ class AuthServiceTest {
     @Mock
     private LoginThrottle loginThrottle;
 
+    @Mock
+    private IRefreshTokenReuseAlerter refreshTokenReuseAlerter;
+
     private final PasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
     private AuthService authService;
@@ -87,7 +91,8 @@ class AuthServiceTest {
         lenient().when(transactionManager.getTransaction(any())).thenReturn(mock(TransactionStatus.class));
 
         authService = new AuthService(
-                userRepository, refreshTokenRepository, loginThrottle, passwordEncoder, jwtEncoder,
+                userRepository, refreshTokenRepository, loginThrottle, refreshTokenReuseAlerter,
+                passwordEncoder, jwtEncoder,
                 serviceClientsProperties, transactionManager,
                 USER_TOKEN_TTL_SECONDS, SERVICE_TOKEN_TTL_SECONDS, REFRESH_TOKEN_TTL_SECONDS);
     }
@@ -358,6 +363,30 @@ class AuthServiceTest {
         verify(refreshTokenRepository).revokeFamily(eq(stored.getFamilyId()), any());
         // No successor: the family is finished, not rotated.
         verify(refreshTokenRepository, never()).save(any());
+        // And somebody gets told - a revocation nothing reports is a security
+        // event that only exists in a database nobody is looking at.
+        verify(refreshTokenReuseAlerter).alert(stored.getFamilyId(), stored.getUserId());
+    }
+
+    /**
+     * The alerting channel is the least reliable thing in this path and the
+     * least important: the family is already revoked by the time it runs. A
+     * pager that is down must not turn a correctly handled security event
+     * into a 500 - same ordering and same reasoning as the stuck-transfer
+     * alert in transaction-service.
+     */
+    @Test
+    void refresh_whenAlertingItselfFails_theFamilyStaysRevokedAndTheCallerStillGets401() {
+        RefreshToken stored = storedToken(UUID.randomUUID(), Instant.now().plusSeconds(3600));
+        givenPresentedTokenResolvesTo(stored);
+        when(refreshTokenRepository.consume(eq(stored.getId()), any())).thenReturn(0);
+        doThrow(new IllegalStateException("pager unreachable"))
+                .when(refreshTokenReuseAlerter).alert(any(), any());
+
+        assertThatThrownBy(() -> authService.refresh(new RefreshTokenRequest(RAW_TOKEN)))
+                .isInstanceOf(InvalidCredentialsException.class);
+
+        verify(refreshTokenRepository).revokeFamily(eq(stored.getFamilyId()), any());
     }
 
     /**

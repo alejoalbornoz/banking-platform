@@ -80,7 +80,10 @@ management:
   endpoints:
     web:
       exposure:
-        include: health, info, gateway
+        # The gateway sees every request before it fans out, so its
+        # metrics are the only place the platform's overall request
+        # rate and latency exist in one series.
+        include: health, info, gateway, metrics, prometheus
 
 logging:
   pattern:

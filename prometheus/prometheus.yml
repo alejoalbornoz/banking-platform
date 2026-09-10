@@ -1,0 +1,31 @@
+# Scrapes every service's /actuator/prometheus and evaluates the rules in
+# alerts.yml against what it finds.
+#
+# There is no Alertmanager here, and that is a deliberate line rather than an
+# omission. Prometheus is what decides an alert is firing; Alertmanager only
+# routes an already-firing alert to a destination - a Slack workspace, a
+# PagerDuty service - and those are credentials for somewhere this repository
+# does not have. The chain that can be demonstrated is demonstrated: the
+# metric exists, it is scraped, the rule evaluates, and the alert goes to
+# FIRING in the UI at http://localhost:9090/alerts.
+global:
+  scrape_interval: 10s      # short because this is a demo, not a fleet
+  evaluation_interval: 10s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: banking-services
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["auth-service:8084"]
+        labels: { service: auth-service }
+      - targets: ["account-service:8081"]
+        labels: { service: account-service }
+      - targets: ["transaction-service:8082"]
+        labels: { service: transaction-service }
+      - targets: ["notification-service:8083"]
+        labels: { service: notification-service }
+      - targets: ["api-gateway:8080"]
+        labels: { service: api-gateway }

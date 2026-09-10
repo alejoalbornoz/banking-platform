@@ -1,5 +1,6 @@
 package com.portfolio.banking.auth.service;
 
+import com.portfolio.banking.auth.alert.IRefreshTokenReuseAlerter;
 import com.portfolio.banking.auth.config.ServiceClientsProperties;
 import com.portfolio.banking.auth.dto.LoginRequest;
 import com.portfolio.banking.auth.dto.RefreshTokenRequest;
@@ -58,6 +59,7 @@ public class AuthService implements IAuthService {
 
     private final IUserRepository userRepository;
     private final LoginThrottle loginThrottle;
+    private final IRefreshTokenReuseAlerter refreshTokenReuseAlerter;
     private final IRefreshTokenRepository refreshTokenRepository;
     private final PasswordEncoder passwordEncoder;
     private final JwtEncoder jwtEncoder;
@@ -84,6 +86,7 @@ public class AuthService implements IAuthService {
     public AuthService(IUserRepository userRepository,
                         IRefreshTokenRepository refreshTokenRepository,
                         LoginThrottle loginThrottle,
+                        IRefreshTokenReuseAlerter refreshTokenReuseAlerter,
                         PasswordEncoder passwordEncoder,
                         JwtEncoder jwtEncoder,
                         ServiceClientsProperties serviceClientsProperties,
@@ -94,6 +97,7 @@ public class AuthService implements IAuthService {
         this.userRepository = userRepository;
         this.refreshTokenRepository = refreshTokenRepository;
         this.loginThrottle = loginThrottle;
+        this.refreshTokenReuseAlerter = refreshTokenReuseAlerter;
         this.passwordEncoder = passwordEncoder;
         this.jwtEncoder = jwtEncoder;
         this.serviceClientsProperties = serviceClientsProperties;
@@ -293,10 +297,19 @@ public class AuthService implements IAuthService {
     private void revokeCompromisedFamily(RefreshToken presented, Instant now) {
         revocationTransactionTemplate.executeWithoutResult(status ->
                 refreshTokenRepository.revokeFamily(presented.getFamilyId(), now));
-        log.warn("Refresh token reuse detected - revoking token family {} for user {}. "
-                        + "Either the token was stolen, or a client refreshed twice with the same token; "
-                        + "both look identical from here.",
-                presented.getFamilyId(), presented.getUserId());
+
+        // Revocation first, alerting second, and failures in the alerting
+        // swallowed - the same ordering and the same reasoning as the
+        // stuck-transfer alert in transaction-service. The family is already
+        // compromised whether or not anyone can be told about it, so an
+        // unreachable alerting channel must not turn a handled security event
+        // into a 500.
+        try {
+            refreshTokenReuseAlerter.alert(presented.getFamilyId(), presented.getUserId());
+        } catch (RuntimeException alertingFailed) {
+            log.error("Failed to raise the refresh-token reuse alert for family {} - the family was revoked "
+                    + "regardless", presented.getFamilyId(), alertingFailed);
+        }
     }
 
     private TokenResponse issueTokenPair(User user, UUID familyId, Instant now) {

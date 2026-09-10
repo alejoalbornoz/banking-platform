@@ -33,6 +33,16 @@
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
 
+        <!-- Serves /actuator/prometheus. Without a registry on the classpath
+             that endpoint is exposed in config and still 404s: the metrics
+             exist, but nothing renders them in the scrape format Prometheus
+             reads. -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
         <!-- Password hashing (BCryptPasswordEncoder) and the SecurityFilterChain
              that keeps register/login/service-token/jwks public and stateless. -->
         <dependency>

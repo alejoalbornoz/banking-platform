@@ -42,6 +42,24 @@ services:
     ports:
       - "9411:9411" # UI: http://localhost:9411
 
+  # Scrapes every service's /actuator/prometheus and evaluates the alert
+  # rules. Depends on nothing: a monitoring system that will not start until
+  # the things it monitors are healthy is useless exactly when it is needed,
+  # so this comes up on its own and reports the others as down until they
+  # arrive.
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: banking-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      # Short retention: this is a demo, and the alerts here evaluate over
+      # minutes rather than weeks.
+      - --storage.tsdb.retention.time=24h
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+    ports:
+      - "9090:9090" # UI: http://localhost:9090, alerts at /alerts
+
   # The five services below all build from the same root Dockerfile, picking
   # their jar with the MODULE arg - see that file for why one shared build
   # stage is cheaper than five.
