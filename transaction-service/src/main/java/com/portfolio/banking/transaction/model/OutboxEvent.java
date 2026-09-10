@@ -18,7 +18,12 @@ import java.util.UUID;
  * "the DB write succeeded but the event was lost" gap, because publishing
  * to RabbitMQ isn't part of this transaction at all; a separate relay
  * (see the messaging package) polls this table afterwards and publishes
- * whatever it finds, retrying indefinitely until {@code published} is set.
+ * whatever it finds.
+ * <p>
+ * Retrying is bounded rather than indefinite: {@code attempts} and
+ * {@code deadAt} exist so that a row nothing can ever publish stops being
+ * retried and starts being reported, instead of sitting at the head of every
+ * poll forever with the whole outbox queued behind it.
  */
 @Entity
 @Table(name = "outbox_events")
@@ -51,6 +56,25 @@ public class OutboxEvent {
     @Column(name = "published_at")
     private Instant publishedAt;
 
+    /**
+     * Failures that were about <em>this message</em>. A broker that is simply
+     * down does not advance it - see {@code OutboxRelay} for why counting
+     * those would turn an outage into data loss.
+     */
+    @Column(nullable = false)
+    private int attempts = 0;
+
+    @Column(name = "last_error", length = 500)
+    private String lastError;
+
+    /**
+     * Set once {@link #attempts} runs out: the relay has stopped trying, and
+     * this event will not be delivered without someone intervening. Null for
+     * every row that is still publishable.
+     */
+    @Column(name = "dead_at")
+    private Instant deadAt;
+
     @CreationTimestamp
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
@@ -69,6 +93,11 @@ public class OutboxEvent {
     public void markPublished() {
         this.published = true;
         this.publishedAt = Instant.now();
+    }
+
+    /** True once the relay has given up on this row. */
+    public boolean isDead() {
+        return deadAt != null;
     }
 
     public UUID getId() {
@@ -93,6 +122,18 @@ public class OutboxEvent {
 
     public boolean isPublished() {
         return published;
+    }
+
+    public int getAttempts() {
+        return attempts;
+    }
+
+    public String getLastError() {
+        return lastError;
+    }
+
+    public Instant getDeadAt() {
+        return deadAt;
     }
 
     public Instant getCreatedAt() {

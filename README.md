@@ -43,6 +43,7 @@ approached rather than to run it:
 | [The transfer saga](#how-a-transfer-works-transaction-service) | Two accounts, two services, no distributed transaction: compensation, crash recovery, and why the saga is deliberately not one big `@Transactional` |
 | [Money that gets stuck](#when-the-compensation-itself-fails) | The one outcome nothing can fix automatically, and what it takes for that to reach a human |
 | [The outbox pattern](#reliable-events-the-outbox-pattern-transaction-service) | Committing and publishing are two systems; crash between them and they disagree forever |
+| [Undeliverable events](#when-an-event-can-never-be-published) | Why counting every failed publish attempt turns a broker outage into permanent data loss |
 | [Idempotent consumption](#consuming-idempotently-and-dead-lettering-what-cant-be-handled-notification-service) | The same constraint trick on the consumer side, plus dead-lettering what can never be processed |
 | [Authentication](#authentication-auth-service-api-gateway) | RS256 and a published JWK set, and why crediting a transfer's destination can never pass an ownership check |
 | [Refresh tokens](#refresh-tokens-rotation-and-detecting-theft) | How rotation turns a stolen token from undetectable into self-announcing, and why the revocation needs its own transaction |
@@ -508,6 +509,52 @@ The trade-off is at-least-once delivery: the relay can crash after publishing
 but before marking the row, so consumers must deduplicate on `eventId`. That
 is why `DomainEvent` carries one.
 
+### When an event can never be published
+
+The relay used to retry every unpublished row on every poll, forever, and
+that was worse than it sounds. The poll is ordered oldest-first, and there was
+no `try` around the per-event publish — so an event that could never be
+published threw, aborted the whole batch, and came back at the head of the
+next one. One bad row stopped the entire outbox indefinitely, and everything
+behind it waited with it. Head-of-line blocking, not a slow retry.
+
+Fixing it needs a distinction that is easy to miss, and getting it wrong
+destroys data:
+
+| Failure | Whose fault | Response |
+|---|---|---|
+| Broker unreachable | nobody's — every row is equally stuck | stop the cycle, count **nothing** |
+| The broker refuses *this message* | this row's | count it; park it after 10 |
+
+The naive version — count every failed attempt — looks correct and quietly
+turns a broker outage into permanent data loss. The relay polls every two
+seconds, so a fifteen-minute RabbitMQ restart would burn any sane attempt
+budget in well under a minute and dead-letter the entire backlog: exactly the
+outcome the outbox pattern exists to make impossible. So connection-level
+exceptions (`AmqpConnectException`, `AmqpIOException`, `AmqpTimeoutException`)
+stop the cycle without advancing any counter, and the next poll finds the same
+work waiting.
+
+A row that runs out of attempts gets `dead_at` set and raises an alert
+(`banking.outbox.dead_lettered`, correct value zero, so any increase fires).
+Parking it silently would only trade one invisible failure for a worse one:
+before, a hopeless event blocked the outbox loudly enough to notice
+eventually; parked and unreported, it would just be a committed state change
+that no consumer ever hears about, with the system looking perfectly healthy.
+
+Note the symmetry this restores. The **consumer** side has had
+retry-then-dead-letter since it was written — `RejectAndDontRequeueRecoverer`
+and an `x-dead-letter-exchange`. The producer side had the retry and not the
+giving up, and the asymmetry was easy to miss precisely because the consumer
+half was the part written carefully.
+
+There is deliberately no endpoint to list or replay dead events. Unlike stuck
+transfers — where money is missing and a human has to act on specific rows —
+a dead outbox event's remedy is to fix whatever made it unpublishable and
+replay it, and *who may replay an event, and what happens if they replay one
+twice* is a real design question rather than a missing CRUD method. The metric
+answers "is anything dead", the log line carries the ids.
+
 Polling is the simple implementation, which is the right call at this scale.
 Production systems at high throughput usually switch to change-data-capture
 (Debezium tailing the WAL) to avoid constantly `SELECT`ing the table.
@@ -829,8 +876,9 @@ logs when someone is investigating.
 
 ## Alerting: what happens when nobody is watching
 
-Two things in this platform genuinely need a human: money that got stuck
-mid-transfer, and a refresh token presented twice. Both already emitted a
+Three things in this platform genuinely need a human: money that got stuck
+mid-transfer, an event that will never be delivered, and a refresh token
+presented twice. Both already emitted a
 counter and a marked log line — and until now both emitted them into a void.
 Three services also advertised `/actuator/prometheus` while returning `404`
 for it, because the endpoint was exposed in config but no registry was on the
@@ -847,6 +895,7 @@ value is:
 | Signal | Correct value | Rule |
 |---|---|---|
 | `banking_transfers_stuck_total` | exactly zero, forever | any increase at all |
+| `banking_outbox_dead_lettered_total` | exactly zero, forever | any increase at all |
 | `banking_auth_refresh_token_reuse_detected_total` | low but **not** zero | more than 5 in 15 minutes |
 
 Money stuck mid-transfer is never acceptable, so the first rule is the
@@ -1131,6 +1180,13 @@ parts:
   Slack workspace or a PagerDuty service, and those are credentials for
   somewhere this repository does not have. The seams to replace are
   `IStuckTransferAlerter` and `IRefreshTokenReuseAlerter`.
+- **A dead-lettered outbox event has to be replayed by hand.** The relay
+  parks it and alerts; getting it delivered afterwards means fixing what
+  made it unpublishable and clearing `dead_at` in the database. An
+  endpoint for that is not a missing CRUD method - *who may replay an
+  event, and what happens when someone replays one twice* is a real
+  design question, and consumers dedupe on `eventId` precisely so the
+  answer can be "replaying is safe".
 - **No dashboards.** Grafana would be a container and a pile of provisioned
   JSON, and dashboards are for looking at things you already know to look at.
   The alerts are the part that finds you.

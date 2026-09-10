@@ -25,6 +25,24 @@ groups:
             GET /api/v1/transfers/stuck lists them (ROLE_SERVICE). Search the
             logs for OPS_ALERT to find the transaction ids.
 
+      # Same correct value as the one above, zero, and for a closely related
+      # reason: every outbox row describes a state change that has ALREADY
+      # committed, so one that never publishes is a permanent disagreement
+      # between transaction-service and everything downstream. Nothing
+      # reconciles it later.
+      - alert: DeadLetteredOutboxEvent
+        expr: increase(banking_outbox_dead_lettered_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "An outbox event will never be delivered ({{ $value | printf \"%.0f\" }} in the last 5m)"
+          description: >-
+            The relay exhausted its attempts on an event and parked it. The
+            state change it describes is committed but its consumers will
+            never hear about it. Logs under OPS_ALERT carry the event id,
+            type and last error.
+
   - name: banking-auth
     rules:
       # Correct value is NOT zero, which is the whole difference. A client

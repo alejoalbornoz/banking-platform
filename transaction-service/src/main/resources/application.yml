@@ -51,6 +51,14 @@ banking:
     exchange: banking.events
   outbox:
     relay-interval-ms: 2000
+    # Attempts before an event is parked as undeliverable. Only
+    # failures about the message itself count - a broker outage does
+    # not, or a fifteen-minute outage would burn this budget in half a
+    # minute and dead-letter the entire backlog. Ten is generous
+    # because the cost of giving up too early (a committed state change
+    # nobody downstream ever hears about) is far worse than the cost of
+    # trying a few more times.
+    max-publish-attempts: 10
 
 management:
   endpoints:
