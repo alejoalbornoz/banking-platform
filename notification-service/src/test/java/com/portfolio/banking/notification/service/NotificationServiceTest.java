@@ -13,6 +13,7 @@ import com.portfolio.banking.notification.model.Notification;
 import com.portfolio.banking.notification.model.NotificationType;
 import com.portfolio.banking.notification.model.ProcessedEvent;
 import com.portfolio.banking.notification.pagination.KeysetPage;
+import com.portfolio.banking.notification.projection.ProjectionRunner;
 import com.portfolio.banking.notification.repository.INotificationRepository;
 import com.portfolio.banking.notification.repository.IProcessedEventRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -74,8 +75,13 @@ class NotificationServiceTest {
         lenient().when(transactionManager.getTransaction(any())).thenReturn(mock(TransactionStatus.class));
         TransactionTemplate transactionTemplate = new TransactionTemplate(transactionManager);
 
+        // A real ProjectionRunner over the mocked marker repository, so the
+        // "already processed" path still runs the actual catch rather than a
+        // stub of it.
+        ProjectionRunner projectionRunner = new ProjectionRunner(processedEventRepository, transactionTemplate);
+
         notificationService = new NotificationService(
-                processedEventRepository, notificationRepository, notificationMapper, transactionTemplate, accountClient);
+                projectionRunner, notificationRepository, notificationMapper, accountClient);
     }
 
     @SuppressWarnings("unchecked")
@@ -94,6 +100,7 @@ class NotificationServiceTest {
         ArgumentCaptor<ProcessedEvent> processedCaptor = ArgumentCaptor.forClass(ProcessedEvent.class);
         verify(processedEventRepository).saveAndFlush(processedCaptor.capture());
         assertThat(processedCaptor.getValue().getEventId()).isEqualTo(event.getEventId());
+        assertThat(processedCaptor.getValue().getProjection()).isEqualTo("notifications");
 
         ArgumentCaptor<List<Notification>> notificationsCaptor = notificationListCaptor();
         verify(notificationRepository).saveAll(notificationsCaptor.capture());

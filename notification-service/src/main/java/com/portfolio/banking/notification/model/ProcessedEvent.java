@@ -1,8 +1,8 @@
 package com.portfolio.banking.notification.model;
 
 import jakarta.persistence.Column;
+import jakarta.persistence.EmbeddedId;
 import jakarta.persistence.Entity;
-import jakarta.persistence.Id;
 import jakarta.persistence.Table;
 import org.hibernate.annotations.CreationTimestamp;
 import org.springframework.data.domain.Persistable;
@@ -25,11 +25,10 @@ import java.util.UUID;
  */
 @Entity
 @Table(name = "processed_events")
-public class ProcessedEvent implements Persistable<UUID> {
+public class ProcessedEvent implements Persistable<ProcessedEventId> {
 
-    @Id
-    @Column(name = "event_id", updatable = false, nullable = false)
-    private UUID eventId;
+    @EmbeddedId
+    private ProcessedEventId id;
 
     @CreationTimestamp
     @Column(name = "processed_at", nullable = false, updatable = false)
@@ -39,12 +38,16 @@ public class ProcessedEvent implements Persistable<UUID> {
         // required by JPA
     }
 
-    public ProcessedEvent(UUID eventId) {
-        this.eventId = eventId;
+    public ProcessedEvent(UUID eventId, String projection) {
+        this.id = new ProcessedEventId(eventId, projection);
     }
 
     public UUID getEventId() {
-        return eventId;
+        return id.getEventId();
+    }
+
+    public String getProjection() {
+        return id.getProjection();
     }
 
     public Instant getProcessedAt() {
@@ -52,8 +55,8 @@ public class ProcessedEvent implements Persistable<UUID> {
     }
 
     @Override
-    public UUID getId() {
-        return eventId;
+    public ProcessedEventId getId() {
+        return id;
     }
 
     /**

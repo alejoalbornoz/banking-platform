@@ -31,7 +31,10 @@ spring:
         - id: notification-service
           uri: http://${NOTIFICATION_SERVICE_HOST:localhost}:${NOTIFICATION_SERVICE_PORT:8083}
           predicates:
-            - Path=/api/v1/notifications/**
+            # Movements live in notification-service too: it is where the
+            # events already arrive. See MovementController for why the
+            # module keeps its name anyway.
+            - Path=/api/v1/notifications/**,/api/v1/movements/**
 
         # These four exist only so the aggregated Swagger UI below can fetch
         # each service's document from this same origin. Without them the

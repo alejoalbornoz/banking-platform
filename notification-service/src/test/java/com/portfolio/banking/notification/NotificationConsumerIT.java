@@ -4,6 +4,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.portfolio.banking.common.event.AccountCreatedEvent;
 import com.portfolio.banking.common.event.TransferCompletedEvent;
 import com.portfolio.banking.notification.model.Notification;
+import com.portfolio.banking.notification.model.Movement;
+import com.portfolio.banking.notification.model.MovementKind;
+import com.portfolio.banking.notification.repository.IMovementRepository;
 import com.portfolio.banking.notification.repository.INotificationRepository;
 import org.junit.jupiter.api.Test;
 import org.springframework.amqp.rabbit.core.RabbitAdmin;
@@ -60,6 +63,9 @@ class NotificationConsumerIT {
 
     @Autowired
     private INotificationRepository notificationRepository;
+
+    @Autowired
+    private IMovementRepository movementRepository;
 
     @Value("${banking.rabbitmq.exchange}")
     private String exchangeName;
@@ -143,6 +149,79 @@ class NotificationConsumerIT {
                             .get(RabbitAdmin.QUEUE_MESSAGE_COUNT);
             assertThat(messageCount).isNotNull().isGreaterThanOrEqualTo(1);
         });
+    }
+
+    /**
+     * The two projections over one event, and the property that makes them
+     * two: each is idempotent on its own marker. Only a database shows that
+     * the same event yields one row for each of two projection names rather
+     * than one marker shared between them.
+     */
+    @Test
+    void oneEvent_feedsBothProjections_eachRecordingItsOwnMarker() throws Exception {
+        UUID sourceId = UUID.randomUUID();
+        UUID destinationId = UUID.randomUUID();
+        UUID sourceOwner = UUID.randomUUID();
+        UUID destinationOwner = UUID.randomUUID();
+        publish("account.created", new AccountCreatedEvent(sourceId, "111111111111", sourceOwner, BigDecimal.ZERO, "USD"));
+        publish("account.created", new AccountCreatedEvent(destinationId, "222222222222", destinationOwner, BigDecimal.ZERO, "USD"));
+        TransferCompletedEvent transfer = new TransferCompletedEvent(
+                UUID.randomUUID(), sourceId, destinationId, new BigDecimal("40.00"), "USD");
+
+        publish("transfer.completed", transfer);
+
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+            List<Movement> mine = movementRepository.findFirstPageByOwner(sourceOwner, null, Pageable.ofSize(50));
+            assertThat(mine).singleElement().satisfies(m -> {
+                assertThat(m.getKind()).isEqualTo(MovementKind.SENT);
+                assertThat(m.getCounterpartyAccountId()).isEqualTo(destinationId);
+                assertThat(m.getTransactionId()).isEqualTo(transfer.getTransactionId());
+            });
+            assertThat(movementRepository.findFirstPageByOwner(destinationOwner, null, Pageable.ofSize(50)))
+                    .singleElement().satisfies(m -> assertThat(m.getKind()).isEqualTo(MovementKind.RECEIVED));
+            // And the notification projection ran too, on the same event.
+            assertThat(notificationRepository.findFirstPageByRecipientAccountId(sourceId, Pageable.ofSize(50))).hasSize(1);
+        });
+    }
+
+    /**
+     * Events arriving in the wrong order, for real: the transfer is published
+     * BEFORE the creation of its destination account. The movement must be
+     * written without an owner and then claimed once the creation arrives -
+     * and the claim is a SQL UPDATE that only a database can be shown to
+     * perform.
+     */
+    @Test
+    void aTransferArrivingBeforeItsAccountWasCreated_isClaimedOnceTheCreationArrives() throws Exception {
+        UUID sourceId = UUID.randomUUID();
+        UUID lateAccountId = UUID.randomUUID();
+        UUID sourceOwner = UUID.randomUUID();
+        UUID lateOwner = UUID.randomUUID();
+        publish("account.created", new AccountCreatedEvent(sourceId, "333333333333", sourceOwner, BigDecimal.ZERO, "USD"));
+        publish("transfer.completed", new TransferCompletedEvent(
+                UUID.randomUUID(), sourceId, lateAccountId, new BigDecimal("10.00"), "USD"));
+
+        // The RECEIVED row exists but belongs to nobody yet.
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+                assertThat(movementRepository.findAll())
+                        .filteredOn(m -> m.getAccountId().equals(lateAccountId))
+                        .singleElement()
+                        .satisfies(m -> assertThat(m.getOwnerId()).isNull()));
+        assertThat(movementRepository.findFirstPageByOwner(lateOwner, null, Pageable.ofSize(50)))
+                .as("not in anyone's statement yet")
+                .isEmpty();
+
+        // Now the creation catches up.
+        publish("account.created", new AccountCreatedEvent(lateAccountId, "444444444444", lateOwner, BigDecimal.ZERO, "USD"));
+
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+                assertThat(movementRepository.findFirstPageByOwner(lateOwner, null, Pageable.ofSize(50)))
+                        .as("claimed: same final state as if the events had arrived in order")
+                        .singleElement()
+                        .satisfies(m -> {
+                            assertThat(m.getKind()).isEqualTo(MovementKind.RECEIVED);
+                            assertThat(m.getCounterpartyAccountId()).isEqualTo(sourceId);
+                        }));
     }
 
     private void publish(String routingKey, Object event) throws Exception {

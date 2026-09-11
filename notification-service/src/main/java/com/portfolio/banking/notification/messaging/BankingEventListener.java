@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.portfolio.banking.common.event.AccountCreatedEvent;
 import com.portfolio.banking.common.event.TransferCompletedEvent;
 import com.portfolio.banking.common.event.TransferFailedEvent;
+import com.portfolio.banking.notification.projection.IMovementProjector;
 import com.portfolio.banking.notification.service.INotificationService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -31,10 +32,14 @@ public class BankingEventListener {
     private static final Logger log = LoggerFactory.getLogger(BankingEventListener.class);
 
     private final INotificationService notificationService;
+    private final IMovementProjector movementProjector;
     private final ObjectMapper objectMapper;
 
-    public BankingEventListener(INotificationService notificationService, ObjectMapper objectMapper) {
+    public BankingEventListener(INotificationService notificationService,
+                                 IMovementProjector movementProjector,
+                                 ObjectMapper objectMapper) {
         this.notificationService = notificationService;
+        this.movementProjector = movementProjector;
         this.objectMapper = objectMapper;
     }
 
@@ -44,10 +49,21 @@ public class BankingEventListener {
         byte[] body = message.getBody();
 
         switch (routingKey) {
-            case "account.created" ->
-                    notificationService.handleAccountCreated(objectMapper.readValue(body, AccountCreatedEvent.class));
-            case "transfer.completed" ->
-                    notificationService.handleTransferCompleted(objectMapper.readValue(body, TransferCompletedEvent.class));
+            // Two projections, each idempotent on its own (event, projection)
+            // key and each in its own transaction. If the second throws, the
+            // message is redelivered: the first is then skipped as already
+            // handled and only the second is retried. Neither can roll the
+            // other back.
+            case "account.created" -> {
+                AccountCreatedEvent event = objectMapper.readValue(body, AccountCreatedEvent.class);
+                notificationService.handleAccountCreated(event);
+                movementProjector.project(event);
+            }
+            case "transfer.completed" -> {
+                TransferCompletedEvent event = objectMapper.readValue(body, TransferCompletedEvent.class);
+                notificationService.handleTransferCompleted(event);
+                movementProjector.project(event);
+            }
             case "transfer.failed" ->
                     notificationService.handleTransferFailed(objectMapper.readValue(body, TransferFailedEvent.class));
             default -> {

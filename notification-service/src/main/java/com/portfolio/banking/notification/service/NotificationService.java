@@ -7,17 +7,14 @@ import com.portfolio.banking.notification.client.IAccountClient;
 import com.portfolio.banking.notification.dto.NotificationResponse;
 import com.portfolio.banking.notification.dto.PageResponse;
 import com.portfolio.banking.notification.pagination.KeysetPage;
+import com.portfolio.banking.notification.projection.ProjectionRunner;
 import com.portfolio.banking.notification.exception.ForbiddenException;
 import com.portfolio.banking.notification.mapper.INotificationMapper;
 import com.portfolio.banking.notification.model.Notification;
-import com.portfolio.banking.notification.model.ProcessedEvent;
 import com.portfolio.banking.notification.repository.INotificationRepository;
-import com.portfolio.banking.notification.repository.IProcessedEventRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.List;
 import java.util.UUID;
@@ -39,21 +36,25 @@ public class NotificationService implements INotificationService {
 
     private static final Logger log = LoggerFactory.getLogger(NotificationService.class);
 
-    private final IProcessedEventRepository processedEventRepository;
+    /**
+     * The name under which this projection records what it has handled. Part
+     * of the stored key, so it is a contract: renaming it would make every
+     * event look new again.
+     */
+    static final String PROJECTION = "notifications";
+
+    private final ProjectionRunner projectionRunner;
     private final INotificationRepository notificationRepository;
     private final INotificationMapper notificationMapper;
-    private final TransactionTemplate transactionTemplate;
     private final IAccountClient accountClient;
 
-    public NotificationService(IProcessedEventRepository processedEventRepository,
+    public NotificationService(ProjectionRunner projectionRunner,
                                 INotificationRepository notificationRepository,
                                 INotificationMapper notificationMapper,
-                                TransactionTemplate transactionTemplate,
                                 IAccountClient accountClient) {
-        this.processedEventRepository = processedEventRepository;
+        this.projectionRunner = projectionRunner;
         this.notificationRepository = notificationRepository;
         this.notificationMapper = notificationMapper;
-        this.transactionTemplate = transactionTemplate;
         this.accountClient = accountClient;
     }
 
@@ -99,35 +100,16 @@ public class NotificationService implements INotificationService {
     }
 
     /**
-     * Marks {@code eventId} processed and creates its notifications
-     * atomically, in one local transaction - both happen or neither does.
-     * <p>
-     * The catch has to sit <em>outside</em> the transaction, not inside the
-     * same callback around just the insert. Postgres aborts a transaction on
-     * the first failed statement; catching the violation and trying to carry
-     * on in the same transaction would just fail again on the very next
-     * statement. Letting {@code TransactionTemplate} roll the whole thing
-     * back first, then catching the exception it rethrows, is what makes it
-     * safe to simply treat "already processed" as nothing left to do here.
-     * <p>
-     * This is deliberately not wrapped in a retry template the way the
-     * ledger's optimistic-lock conflicts are. That retried a race between two
-     * different operations that both deserved to be applied. Here, a
-     * constraint violation always means the exact same event was already
-     * handled - there is no winner's outcome to adopt, nothing to redo, and
-     * no caller waiting on a response. It's just a no-op.
+     * Idempotency lives in {@link ProjectionRunner} now, shared with the
+     * movements projection; what is left here is only what this projection
+     * writes for an event.
      */
     private void processIdempotently(UUID eventId, Supplier<List<Notification>> notificationsToCreate) {
-        try {
-            transactionTemplate.executeWithoutResult(status -> {
-                processedEventRepository.saveAndFlush(new ProcessedEvent(eventId));
-                List<Notification> notifications = notificationsToCreate.get();
-                notificationRepository.saveAll(notifications);
-                notifications.forEach(n -> log.info("Notification [{}] to account {}: {}",
-                        n.getType(), n.getRecipientAccountId(), n.getMessage()));
-            });
-        } catch (DataIntegrityViolationException alreadyProcessed) {
-            log.info("Event {} already processed - skipping redelivery", eventId);
-        }
+        projectionRunner.runOnce(PROJECTION, eventId, () -> {
+            List<Notification> notifications = notificationsToCreate.get();
+            notificationRepository.saveAll(notifications);
+            notifications.forEach(n -> log.info("Notification [{}] to account {}: {}",
+                    n.getType(), n.getRecipientAccountId(), n.getMessage()));
+        });
     }
 }

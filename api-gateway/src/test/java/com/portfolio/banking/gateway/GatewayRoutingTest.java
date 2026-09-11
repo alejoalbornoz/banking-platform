@@ -59,6 +59,7 @@ class GatewayRoutingTest {
                 .withHeader("Content-Type", "application/json").withBody("{\"items\":[],\"nextCursor\":null}")));
         stubFor(post(urlPathEqualTo("/api/v1/transfers")).willReturn(aResponse().withStatus(201)));
         stubFor(get(urlPathEqualTo("/api/v1/notifications")).willReturn(aResponse().withStatus(200)));
+        stubFor(get(urlPathEqualTo("/api/v1/movements")).willReturn(aResponse().withStatus(200)));
         stubFor(post(urlPathEqualTo("/api/v1/auth/login")).willReturn(aResponse().withStatus(200)));
         stubFor(get(urlPathEqualTo("/.well-known/jwks.json")).willReturn(aResponse().withStatus(200)));
 
@@ -66,6 +67,7 @@ class GatewayRoutingTest {
                 .expectBody().jsonPath("$.items").isArray();
         client.post().uri("/api/v1/transfers").exchange().expectStatus().isCreated();
         client.get().uri("/api/v1/notifications?accountId=x").exchange().expectStatus().isOk();
+        client.get().uri("/api/v1/movements").exchange().expectStatus().isOk();
         client.post().uri("/api/v1/auth/login").exchange().expectStatus().isOk();
         client.get().uri("/.well-known/jwks.json").exchange().expectStatus().isOk();
 

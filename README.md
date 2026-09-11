@@ -45,6 +45,7 @@ approached rather than to run it:
 | [The outbox pattern](#reliable-events-the-outbox-pattern-transaction-service) | Committing and publishing are two systems; crash between them and they disagree forever |
 | [Undeliverable events](#when-an-event-can-never-be-published) | Why counting every failed publish attempt turns a broker outage into permanent data loss |
 | [Idempotent consumption](#consuming-idempotently-and-dead-lettering-what-cant-be-handled-notification-service) | The same constraint trick on the consumer side, plus dead-lettering what can never be processed |
+| [The read model](#a-read-model-every-movement-across-every-account-notification-service) | A query with no network call, events that arrive out of order, and what building it revealed about a different service |
 | [Authentication](#authentication-auth-service-api-gateway) | RS256 and a published JWK set, and why crediting a transfer's destination can never pass an ownership check |
 | [Refresh tokens](#refresh-tokens-rotation-and-detecting-theft) | How rotation turns a stolen token from undetectable into self-announcing, and why the revocation needs its own transaction |
 | [Password change and reset](#changing-and-recovering-a-password) | Why a password change that leaves other sessions alive is worse than not offering one |
@@ -295,7 +296,18 @@ curl "localhost:8080/api/v1/notifications?accountId={accountId}&limit=10" \
 
 A completed transfer produces two rows: one for the sender (`TRANSFER_SENT`)
 and one for the receiver (`TRANSFER_RECEIVED`), each queryable by their own
-account id. Like every list here it comes back as `{ items, nextCursor }`;
+account id.
+
+```bash
+# Every movement across ALL your accounts, with the counterparty - the one
+# merged statement. No accountId needed; add one to narrow it.
+curl "localhost:8080/api/v1/movements?limit=10" -H "Authorization: Bearer {token}"
+```
+
+Run a transfer and then call this as *both* users: the sender sees a `SENT`
+with the receiver's account as counterparty, the receiver sees a `RECEIVED`
+with the sender's. Neither call touches account-service - see "A read model"
+below. Like every list here it comes back as `{ items, nextCursor }`;
 the ownership check runs on every page, not just the first, so a cursor for
 someone else's account is still a 403.
 
@@ -621,6 +633,103 @@ and once those are exhausted, `RejectAndDontRequeueRecoverer` rejects the
 message without requeueing it - which, because of that queue argument, routes
 it to the dead-letter queue instead of either looping on this queue forever or
 disappearing silently.
+
+## A read model: every movement, across every account (notification-service)
+
+The ledger already lists every posting on an account and `GET /transfers`
+already lists what you sent. What neither could answer was the one question a
+statement exists for: *everything that happened to my money, across all my
+accounts, with who the other side was.* The ledger has no counterparty — an
+entry carries an operation key, not the other account — and reading across
+accounts first needs to know which accounts are yours, which lives in another
+service. So the README listed the merged view as a gap, and said the honest
+options were a read model fed by events or a query service that fans out.
+
+This is the read model. Two projections in notification-service, built from
+the events it was already consuming:
+
+| Table | From | Answers |
+|---|---|---|
+| `account_owners` | `account.created` | which account belongs to whom |
+| `movements` | `account.created`, `transfer.completed` | OPENING / SENT / RECEIVED per account, with counterparty and transaction id |
+
+**`GET /api/v1/movements` makes no network call**, and that is the whole
+payoff. Every other read in this service asks account-service "who owns this
+account?" over HTTP before answering. This one has the ownership as a column,
+projected from the same event stream — so the query is
+`WHERE owner_id = :caller`, scoped to the token by construction. There is no
+ownership check to get wrong, an `accountId` filter the caller does not own
+matches nothing rather than 403ing, and the method can be `@Transactional`
+because nothing inside it leaves the database.
+
+### Two projections need two cursors
+
+`processed_events` used to answer "has this event been handled". With two
+projections that has no single answer: an event can be handled by
+notifications and not yet by movements, and a replayed event must be skipped
+by the one that saw it and taken by the one that did not. So the key is now
+`(event_id, projection)`, every existing row is attributed to the projection
+that wrote it, and each projection records its own marker in the same
+transaction as its own writes.
+
+That is what keeps them independent. The listener calls both; if the second
+throws, the message is redelivered, the first is skipped as already handled,
+and only the second is retried. A bug in one projection cannot roll back the
+other, and — the reason this matters beyond tidiness — a future projection
+can be added and fed from a replay without the existing ones reprocessing
+anything.
+
+### Events arrive out of order, and the projection has to not care
+
+`account.created` comes from account-service. `transfer.completed` comes from
+transaction-service's outbox relay. A transfer needs its accounts to exist,
+so in practice the creation is published first — but "in practice" is not a
+guarantee, and a redelivery, a consumer restart or a slow relay can put a
+transfer in front of the creation of one of its own accounts. A projection
+that assumed order would then hold a movement it cannot attribute to anyone,
+and every naive response is wrong: dropping it loses a statement line,
+rejecting it dead-letters a message over a condition that resolves itself in
+a second, and pausing the consumer until the other publisher catches up
+stalls every event behind it.
+
+The answer is to write the movement anyway, with `owner_id` null, and to have
+the `account.created` handler **claim** whatever was waiting for it:
+
+```sql
+UPDATE movements SET owner_id = :owner
+ WHERE account_id = :account AND owner_id IS NULL
+```
+
+Either order produces the same final state, which is the property a
+projection actually needs. `NotificationConsumerIT` publishes the transfer
+*before* the account's creation, on a real broker, and watches the row appear
+ownerless and then get claimed.
+
+### What building this revealed about account-service
+
+account-service publishes after commit with no outbox. The outbox section
+above defends that: a crash between commit and publish loses a welcome
+notification, and nobody would miss one. **That defence no longer holds.**
+This projection depends on `account.created` for ownership, so a lost one now
+means an account whose movements are never attributed to anyone — and
+permanently, because nothing will ever publish it again. A read model has
+turned a tolerable gap in another service into an intolerable one, without
+touching that service. It is listed in "Known gaps" as exactly that, and it is
+a useful thing to have been forced to notice: the reliability an event needs
+is decided by its most demanding consumer, not by its publisher.
+
+### What it does not do
+
+- **History before the projection is not in it.** The movements table starts
+  empty at deployment. Rebuilding it would mean replaying every event, which
+  needs an event store; RabbitMQ retains nothing, and account-service has no
+  outbox to replay from. The ledger remains the complete record.
+- **Failed transfers are not movements.** Nothing moved, or it moved and was
+  undone; the account's money is where it was. That is a notification.
+- **The service is misnamed.** Something that projects two read models is a
+  query service, not a notification service. Renaming a module touches
+  compose, the gateway, the Dockerfile, CI and this file for no behavioural
+  change, so it keeps its name — but that is a wart, not a design.
 
 ## Authentication (auth-service, api-gateway)
 
@@ -1305,12 +1414,15 @@ parts:
 - **No dashboards.** Grafana would be a container and a pile of provisioned
   JSON, and dashboards are for looking at things you already know to look at.
   The alerts are the part that finds you.
-- **There is no single "all my movements" view.** `GET /transfers` lists what
-  you sent; what you received is in the account ledger and in notifications.
-  Assembling one merged, paginated timeline across two services means either
-  a read model fed by the existing events or a query service that fans out
-  and merges - a real design decision, not a missing endpoint, so it isn't
-  faked here with something that only works while the data is small.
+- **account-service's after-commit publish is no longer good enough.** It
+  was defended as fine for a welcome notification; the movements read model
+  now depends on `account.created` for ownership, so a crash between commit
+  and publish leaves an account whose movements are never anyone's. The fix
+  is the outbox pattern transaction-service already has, applied to
+  account-service. See "A read model".
+- **The movements read model has no history from before it existed**, and
+  cannot rebuild one without an event store to replay from. The ledger is the
+  complete record; the read model is the convenient one.
 - **No per-IP rate limiting at the gateway.** The login throttle counts
   failures per address, which stops someone working through passwords for one
   account but not an attack spread thinly across many addresses, nor one
