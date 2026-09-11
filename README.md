@@ -51,6 +51,7 @@ approached rather than to run it:
 | [Login throttling](#throttling-the-front-door-without-handing-out-a-new-attack) | Why lockout is a worse attack than the one it prevents, and how a throttle can accidentally become the user-enumeration oracle it sits next to |
 | [Alerting](#alerting-what-happens-when-nobody-is-watching) | Two signals with different correct values, and why that means they cannot share an alert rule |
 | [Pagination](#paginating-the-lists-all-three-services) | Why a cursor and not an offset, and the reconciliation check that paginating a statement quietly turns into a lie |
+| [Web-layer tests](#the-web-layer-tested-without-docker) | Why the JWT decoder is mocked but the security filter is not, and the bug the slices found on their first run |
 | [Integration tests](#integration-tests) | Four bugs that unit tests couldn't have caught, and exactly why each one was invisible |
 | [Known gaps](#known-gaps) | What isn't solved, and which of those were deliberate |
 
@@ -1104,6 +1105,55 @@ have been worse than admitting the gap.
 `GET /transfers/stuck` stays deliberately unpaginated. Its correct size is
 zero, and if it ever returns enough rows for paging to matter, the paging is
 not the problem.
+
+## The web layer, tested without Docker
+
+For a long stretch, every controller in this project was tested only by the
+`*IT` classes — which need Docker, and therefore ran only in CI, after the
+push. That left a class of bug invisible to `mvn test`: two of the three
+increments before this one reached `docker compose up` with a bug that a
+hundred-plus green unit tests could not see. One was a `CHAR(64)` column that
+Hibernate's schema validation refused; the other was a missing
+`oauth2-resource-server` dependency that stopped the security filter chain
+from being built at all. Nothing under `mvn test` starts a Spring context, so
+nothing under `mvn test` could notice.
+
+Each service now has a `*ControllerWebTest`: a `@WebMvcTest` slice that
+starts the real controller, the real `GlobalExceptionHandler`, and the real
+`SecurityConfig`, with the service interface mocked. They pin what the unit
+tests structurally cannot — which caller may reach which route, what each
+failure looks like on the wire, and that validation returns `400` naming the
+right field rather than `500`.
+
+**The `JwtDecoder` is mocked; the security filter is not.** Every request goes
+through the real `BearerTokenAuthenticationFilter` and the real
+`JwtAuthenticationConverter` that maps the plain-string `role` claim to a
+`ROLE_*` authority. Injecting an already-built authentication — the usual
+shortcut — would test everything except that converter, and the converter is
+the part most likely to be wrong.
+
+**api-gateway went from zero tests to routing tests against a fake backend.**
+Its whole job is forwarding to somebody, so it cannot be tested without a
+somebody; WireMock plays every downstream at once, which is why the route
+URIs carry overridable `*_SERVICE_PORT` variables. The two things pinned are
+the ones that break silently: the `RewritePath` regexes behind the aggregated
+Swagger UI, and that the `Authorization` header reaches the backend untouched
+— every downstream validates it, and a gateway that dropped it would turn
+every request into a `401` while looking perfectly healthy itself.
+
+**The slices found a bug on their first run.** `GET /notifications` with no
+`accountId` returned `500`: notification-service's exception handler had no
+case for a missing request parameter, so it fell through to the catch-all. The
+same handler for missing *headers* has existed in the other services since
+they were written; this service simply never had a required parameter before.
+A ten-line fix, and the kind that a reviewer finds with one curl.
+
+What these do not do, stated plainly: they load no JPA, no Flyway, no
+database. The `CHAR(64)` bug would still only be caught by an `*IT` or by
+starting the service, because "does the mapping match the schema" is a
+question only a database can answer. The slices close the gap for the
+security and HTTP layers; the ITs remain the only proof for anything that
+touches storage.
 
 ## Integration tests
 

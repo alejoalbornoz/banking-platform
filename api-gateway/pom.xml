@@ -50,6 +50,14 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- A fake downstream for the routing tests: the gateway's whole job
+             is to forward to somebody, so it cannot be tested without a
+             somebody. Version comes from the Spring Cloud BOM. -->
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-contract-wiremock</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>

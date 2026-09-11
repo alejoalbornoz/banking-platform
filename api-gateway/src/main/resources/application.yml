@@ -12,21 +12,24 @@ spring:
       # and "Authentication" in the README) - validating a token here too
       # would just duplicate that check, not add a real second line of
       # defense, since the gateway and the services all trust the same JWKS.
+      # Host and port are both overridable. Compose sets the hosts; the
+      # ports exist so GatewayRoutingTest can point every route at one
+      # in-process fake backend. Nothing else ever sets them.
       routes:
         - id: auth-service
-          uri: http://${AUTH_SERVICE_HOST:localhost}:8084
+          uri: http://${AUTH_SERVICE_HOST:localhost}:${AUTH_SERVICE_PORT:8084}
           predicates:
             - Path=/api/v1/auth/**,/.well-known/**
         - id: account-service
-          uri: http://${ACCOUNT_SERVICE_HOST:localhost}:8081
+          uri: http://${ACCOUNT_SERVICE_HOST:localhost}:${ACCOUNT_SERVICE_PORT:8081}
           predicates:
             - Path=/api/v1/accounts/**
         - id: transaction-service
-          uri: http://${TRANSACTION_SERVICE_HOST:localhost}:8082
+          uri: http://${TRANSACTION_SERVICE_HOST:localhost}:${TRANSACTION_SERVICE_PORT:8082}
           predicates:
             - Path=/api/v1/transfers/**
         - id: notification-service
-          uri: http://${NOTIFICATION_SERVICE_HOST:localhost}:8083
+          uri: http://${NOTIFICATION_SERVICE_HOST:localhost}:${NOTIFICATION_SERVICE_PORT:8083}
           predicates:
             - Path=/api/v1/notifications/**
 
@@ -35,25 +38,25 @@ spring:
         # browser would have to reach four different ports, which is both a
         # cross-origin problem and the opposite of what a gateway is for.
         - id: auth-service-docs
-          uri: http://${AUTH_SERVICE_HOST:localhost}:8084
+          uri: http://${AUTH_SERVICE_HOST:localhost}:${AUTH_SERVICE_PORT:8084}
           predicates:
             - Path=/docs/auth-service/v3/api-docs
           filters:
             - RewritePath=/docs/auth-service/v3/api-docs, /v3/api-docs
         - id: account-service-docs
-          uri: http://${ACCOUNT_SERVICE_HOST:localhost}:8081
+          uri: http://${ACCOUNT_SERVICE_HOST:localhost}:${ACCOUNT_SERVICE_PORT:8081}
           predicates:
             - Path=/docs/account-service/v3/api-docs
           filters:
             - RewritePath=/docs/account-service/v3/api-docs, /v3/api-docs
         - id: transaction-service-docs
-          uri: http://${TRANSACTION_SERVICE_HOST:localhost}:8082
+          uri: http://${TRANSACTION_SERVICE_HOST:localhost}:${TRANSACTION_SERVICE_PORT:8082}
           predicates:
             - Path=/docs/transaction-service/v3/api-docs
           filters:
             - RewritePath=/docs/transaction-service/v3/api-docs, /v3/api-docs
         - id: notification-service-docs
-          uri: http://${NOTIFICATION_SERVICE_HOST:localhost}:8083
+          uri: http://${NOTIFICATION_SERVICE_HOST:localhost}:${NOTIFICATION_SERVICE_PORT:8083}
           predicates:
             - Path=/docs/notification-service/v3/api-docs
           filters:

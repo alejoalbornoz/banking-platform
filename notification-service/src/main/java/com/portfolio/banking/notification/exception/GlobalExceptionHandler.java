@@ -7,6 +7,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
@@ -31,6 +32,20 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(ForbiddenException.class)
     public ResponseEntity<ErrorResponse> handleForbidden(ForbiddenException ex, HttpServletRequest request) {
         return build(HttpStatus.FORBIDDEN, ex.getErrorCode(), ex.getMessage(), request, List.of());
+    }
+
+    /**
+     * Without this, {@code GET /notifications} with no {@code accountId} fell
+     * through to the catch-all and came back as a 500 - telling the caller
+     * the server broke, when in fact their request did. Found by
+     * {@code NotificationControllerWebTest}; the same handler for missing
+     * headers has existed in the other services since they were written,
+     * and this service simply never had a required parameter before.
+     */
+    @ExceptionHandler(MissingServletRequestParameterException.class)
+    public ResponseEntity<ErrorResponse> handleMissingParameter(MissingServletRequestParameterException ex,
+                                                                 HttpServletRequest request) {
+        return build(HttpStatus.BAD_REQUEST, "MISSING_PARAMETER", ex.getMessage(), request, List.of());
     }
 
     @ExceptionHandler(IllegalArgumentException.class)
