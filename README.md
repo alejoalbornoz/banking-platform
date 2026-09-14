@@ -1433,11 +1433,6 @@ parts:
 - **`/register` is not throttled either.** It is unauthenticated and does a
   bcrypt per call, so it is the same shape of problem; the same counter would
   cover it, keyed the same way.
-- **Nothing consumes the refresh-token reuse warning either.** Detecting
-  reuse revokes the family and writes a WARN line naming it, which is the
-  right thing to have happened - but somebody stealing sessions is exactly
-  the event a human should hear about, and this is the same missing last mile
-  as the stuck-transfer counter above.
 - **An access token still can't be revoked mid-life.** That is inherent to
   validating it offline against the JWK set, and refresh tokens narrow it
   rather than close it: revoking a family stops the session from continuing,

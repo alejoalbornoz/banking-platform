@@ -39,10 +39,21 @@ import static org.awaitility.Awaitility.await;
  * <p>
  * Consumption is asynchronous relative to the publish call, so every
  * assertion here polls with Awaitility rather than asserting immediately.
+ * <p>
+ * All six tests share one queue and one consumer, drained sequentially, so
+ * a cold CI runner processes this class's whole message backlog - including
+ * the ~1.5s of retries the unparseable-payload test spends before
+ * dead-lettering - on the same single thread. The poll timeout is sized for
+ * that worst case, not for the local happy path where each message is
+ * handled in milliseconds. Every assertion is keyed by a random id, so tests
+ * never see each other's data; the only thing they contend for is the clock.
  */
 @Testcontainers
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class NotificationConsumerIT {
+
+    /** Generous on purpose - see the class javadoc. One shared consumer, a cold CI runner. */
+    private static final Duration AWAIT = Duration.ofSeconds(30);
 
     @Container
     @ServiceConnection
@@ -81,7 +92,7 @@ class NotificationConsumerIT {
 
         publish("account.created", event);
 
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+        await().atMost(AWAIT).untilAsserted(() -> {
             List<Notification> notifications =
                     notificationRepository.findFirstPageByRecipientAccountId(accountId, Pageable.ofSize(200));
             assertThat(notifications).hasSize(1);
@@ -106,7 +117,7 @@ class NotificationConsumerIT {
         rabbitTemplate.send(exchangeName, "account.created", messageOf(payload));
         rabbitTemplate.send(exchangeName, "account.created", messageOf(payload));
 
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+        await().atMost(AWAIT).untilAsserted(() ->
                 assertThat(notificationRepository.findFirstPageByRecipientAccountId(accountId, Pageable.ofSize(200)))
                         .as("one notification despite two deliveries of the same event")
                         .hasSize(1));
@@ -121,7 +132,7 @@ class NotificationConsumerIT {
 
         publish("transfer.completed", event);
 
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+        await().atMost(AWAIT).untilAsserted(() -> {
             assertThat(notificationRepository.findFirstPageByRecipientAccountId(sourceId, Pageable.ofSize(200)))
                     .hasSize(1);
             assertThat(notificationRepository.findFirstPageByRecipientAccountId(destinationId, Pageable.ofSize(200)))
@@ -143,7 +154,7 @@ class NotificationConsumerIT {
         rabbitTemplate.send(exchangeName, "account.created",
                 messageOf("this is not valid JSON".getBytes(StandardCharsets.UTF_8)));
 
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+        await().atMost(AWAIT).untilAsserted(() -> {
             Integer messageCount = rabbitAdmin.getQueueProperties(deadLetterQueueName) == null ? null
                     : (Integer) rabbitAdmin.getQueueProperties(deadLetterQueueName)
                             .get(RabbitAdmin.QUEUE_MESSAGE_COUNT);
@@ -170,7 +181,7 @@ class NotificationConsumerIT {
 
         publish("transfer.completed", transfer);
 
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+        await().atMost(AWAIT).untilAsserted(() -> {
             List<Movement> mine = movementRepository.findFirstPageByOwner(sourceOwner, null, Pageable.ofSize(50));
             assertThat(mine).singleElement().satisfies(m -> {
                 assertThat(m.getKind()).isEqualTo(MovementKind.SENT);
@@ -202,7 +213,7 @@ class NotificationConsumerIT {
                 UUID.randomUUID(), sourceId, lateAccountId, new BigDecimal("10.00"), "USD"));
 
         // The RECEIVED row exists but belongs to nobody yet.
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+        await().atMost(AWAIT).untilAsserted(() ->
                 assertThat(movementRepository.findAll())
                         .filteredOn(m -> m.getAccountId().equals(lateAccountId))
                         .singleElement()
@@ -214,7 +225,7 @@ class NotificationConsumerIT {
         // Now the creation catches up.
         publish("account.created", new AccountCreatedEvent(lateAccountId, "444444444444", lateOwner, BigDecimal.ZERO, "USD"));
 
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+        await().atMost(AWAIT).untilAsserted(() ->
                 assertThat(movementRepository.findFirstPageByOwner(lateOwner, null, Pageable.ofSize(50)))
                         .as("claimed: same final state as if the events had arrived in order")
                         .singleElement()
