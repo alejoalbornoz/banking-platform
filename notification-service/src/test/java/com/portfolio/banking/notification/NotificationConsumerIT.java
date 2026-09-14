@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.portfolio.banking.common.event.AccountCreatedEvent;
 import com.portfolio.banking.common.event.TransferCompletedEvent;
 import com.portfolio.banking.notification.model.Notification;
+import com.portfolio.banking.notification.model.NotificationType;
 import com.portfolio.banking.notification.model.Movement;
 import com.portfolio.banking.notification.model.MovementKind;
 import com.portfolio.banking.notification.repository.IMovementRepository;
@@ -52,7 +53,12 @@ import static org.awaitility.Awaitility.await;
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class NotificationConsumerIT {
 
-    /** Generous on purpose - see the class javadoc. One shared consumer, a cold CI runner. */
+    /**
+     * Generous because consumption is asynchronous and one shared consumer
+     * drains every test's messages on a single thread; a cold CI runner is
+     * slower than a warm laptop. It is a ceiling, not a delay - the happy
+     * path returns in milliseconds.
+     */
     private static final Duration AWAIT = Duration.ofSeconds(30);
 
     @Container
@@ -190,8 +196,16 @@ class NotificationConsumerIT {
             });
             assertThat(movementRepository.findFirstPageByOwner(destinationOwner, null, Pageable.ofSize(50)))
                     .singleElement().satisfies(m -> assertThat(m.getKind()).isEqualTo(MovementKind.RECEIVED));
-            // And the notification projection ran too, on the same event.
-            assertThat(notificationRepository.findFirstPageByRecipientAccountId(sourceId, Pageable.ofSize(50))).hasSize(1);
+            // And the notification projection ran too, on the same event. Not
+            // hasSize(1): the source account also gets an ACCOUNT_CREATED
+            // notification from its own creation event - a movement is skipped
+            // for a zero opening balance, but a notification never is. What
+            // this test cares about is that the transfer reached the
+            // notifications projection, so it checks for that type rather than
+            // the total.
+            assertThat(notificationRepository.findFirstPageByRecipientAccountId(sourceId, Pageable.ofSize(50)))
+                    .extracting(Notification::getType)
+                    .contains(NotificationType.TRANSFER_SENT);
         });
     }
 
